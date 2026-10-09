@@ -21,6 +21,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.Settings
 import android.media.AudioManager
+import android.media.ToneGenerator
 import android.telephony.SmsManager
 import android.telephony.SmsMessage
 import android.widget.Toast
@@ -42,6 +43,13 @@ class AutomationForegroundService : Service() {
     private val receivers = mutableListOf<android.content.BroadcastReceiver>()
     private val scheduleJobs = mutableListOf<Job>()
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var findJob: Job? = null
+    private var findCameraManager: CameraManager? = null
+    private var findCameraId: String? = null
+    private var findToneGenerator: ToneGenerator? = null
+    private var findAudioManager: AudioManager? = null
+    private var previousRingerMode: Int? = null
+    private var previousAlarmVolume: Int? = null
 
     private data class RunningFlow(val name: String, val program: Program, val interpreter: Interpreter, val mutex: Mutex = Mutex())
 
@@ -53,13 +61,25 @@ class AutomationForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         serviceScope.launch {
+            when (intent?.action) {
+                ACTION_FIND_STOP -> {
+                    stopPhoneFinder()
+                    if (AutomationStore.enabledScripts(this@AutomationForegroundService).isEmpty()) {
+                        stopSelf(startId)
+                    } else {
+                        updateNotification("Поиск остановлен")
+                    }
+                    return@launch
+                }
+                ACTION_FIND_START -> startPhoneFinder()
+            }
             reloadMutex.withLock {
                 clearTriggers()
                 synchronized(flows) { flows.clear() }
                 val scripts = AutomationStore.scripts(this@AutomationForegroundService)
                 val enabled = AutomationStore.enabledScripts(this@AutomationForegroundService)
                 if (enabled.isEmpty()) {
-                    stopSelf(startId)
+                    if (findJob?.isActive != true) stopSelf(startId)
                     return@withLock
                 }
                 val errors = mutableListOf<String>()
@@ -80,8 +100,12 @@ class AutomationForegroundService : Service() {
                     }
                 }
                 if (flowSnapshot().isEmpty()) {
-                    updateNotification(errors.joinToString("; ").ifEmpty { "Нет активных сценариев" })
-                    stopSelf(startId)
+                    if (findJob?.isActive == true) {
+                        updateNotification("Поиск телефона: сигнал и вспышка активны")
+                    } else {
+                        updateNotification(errors.joinToString("; ").ifEmpty { "Нет активных сценариев" })
+                        stopSelf(startId)
+                    }
                     return@withLock
                 }
                 try {
@@ -109,6 +133,91 @@ class AutomationForegroundService : Service() {
             runCatching { manager.unregisterNetworkCallback(callback) }
         }
         networkCallback = null
+    }
+
+    private fun startPhoneFinder() {
+        stopPhoneFinder()
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            updateNotification("Для поиска требуется разрешение CAMERA")
+            return
+        }
+        try {
+            val cameraManager = getSystemService(CameraManager::class.java)
+            val cameraId = cameraManager.cameraIdList.firstOrNull()
+                ?: throw IllegalStateException("Фонарик недоступен")
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            findCameraManager = cameraManager
+            findCameraId = cameraId
+            findAudioManager = audioManager
+            previousRingerMode = audioManager.ringerMode
+            previousAlarmVolume = audioManager.getStreamVolume(AudioManager.STREAM_ALARM)
+            audioManager.ringerMode = AudioManager.RINGER_MODE_NORMAL
+            audioManager.setStreamVolume(
+                AudioManager.STREAM_ALARM,
+                audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM),
+                0
+            )
+            findToneGenerator = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+            updateNotification("Поиск телефона: сигнал и вспышка активны")
+            findJob = serviceScope.launch {
+                try {
+                    while (isActive) {
+                        cameraManager.setTorchMode(cameraId, true)
+                        findToneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 400)
+                        delay(500)
+                        cameraManager.setTorchMode(cameraId, false)
+                        delay(500)
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    updateNotification("Ошибка поиска телефона: ${error.message}")
+                    stopPhoneFinder()
+                }
+            }
+        } catch (error: Exception) {
+            stopPhoneFinder()
+            updateNotification("Не удалось запустить поиск телефона: ${error.message}")
+        }
+    }
+
+    private fun stopPhoneFinder() {
+        findJob?.cancel()
+        findJob = null
+        val cleanupErrors = mutableListOf<String>()
+        val cameraManager = findCameraManager
+        val cameraId = findCameraId
+        if (cameraManager != null && cameraId != null) {
+            try {
+                cameraManager.setTorchMode(cameraId, false)
+            } catch (error: Exception) {
+                cleanupErrors += "фонарик: ${error.message}"
+            }
+        }
+        findToneGenerator?.let { tone ->
+            tone.stopTone()
+            tone.release()
+        }
+        findToneGenerator = null
+        val audioManager = findAudioManager
+        if (audioManager != null) {
+            try {
+                previousAlarmVolume?.let {
+                    audioManager.setStreamVolume(AudioManager.STREAM_ALARM, it, 0)
+                }
+                previousRingerMode?.let { audioManager.ringerMode = it }
+            } catch (error: Exception) {
+                cleanupErrors += "звук: ${error.message}"
+            }
+        }
+        findCameraManager = null
+        findCameraId = null
+        findAudioManager = null
+        previousRingerMode = null
+        previousAlarmVolume = null
+        if (cleanupErrors.isNotEmpty()) {
+            updateNotification("Не удалось полностью остановить поиск: ${cleanupErrors.joinToString()}")
+        }
     }
 
     private fun validateEvents(program: Program) {
@@ -337,6 +446,7 @@ class AutomationForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        stopPhoneFinder()
         clearTriggers()
         serviceScope.cancel()
         super.onDestroy()
@@ -363,6 +473,8 @@ class AutomationForegroundService : Service() {
 
     companion object {
         const val EXTRA_SCRIPT = "script"
+        const val ACTION_FIND_START = "com.noxautomate.action.FIND_START"
+        const val ACTION_FIND_STOP = "com.noxautomate.action.FIND_STOP"
         private const val CHANNEL_ID = "automation"
         private const val NOTIFICATION_ID = 1001
     }
@@ -526,7 +638,7 @@ private class AndroidDslHost(private val context: Context) : DslHost {
                 val location = runCatching { locationManager.getLastKnownLocation(provider) }.getOrNull()
                 val latitude = location?.latitude ?: 0.0
                 val longitude = location?.longitude ?: 0.0
-                val accuracy = location?.accuracy ?: 0.0
+                val accuracy = location?.accuracy?.toDouble() ?: 0.0
                 DslValue.Mapping(mutableMapOf(
                     DslValue.Text("latitude") to DslValue.Number(latitude, latitude % 1.0 == 0.0),
                     DslValue.Text("longitude") to DslValue.Number(longitude, longitude % 1.0 == 0.0),
