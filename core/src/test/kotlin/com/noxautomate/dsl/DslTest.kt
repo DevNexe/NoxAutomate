@@ -161,4 +161,32 @@ class DslTest {
         interpreter.executeEvent(program, "app.foreground", mapOf("package_name" to DslValue.Text("com.example")))
         assertEquals(listOf("charging", "screen", "network", "timer", "app"), events)
     }
+
+    @Test
+    fun smsEventExposesSenderAndBodyToConditions() {
+        val program = Parser(Lexer("""
+            on sms.received():
+                if sender == "+79990000000" and "НАЙДИ" in message:
+                    system.record(value=body)
+        """.trimIndent()).tokenize()).parse()
+        var recorded: DslValue? = null
+        val interpreter = Interpreter(object : DslHost {
+            override fun invoke(function: String, positional: List<DslValue>, named: Map<String, DslValue>): DslValue {
+                recorded = named.getValue("value")
+                return DslValue.Null
+            }
+        })
+
+        interpreter.executeEvent(
+            program,
+            "sms.received",
+            mapOf(
+                "sender" to DslValue.Text("+79990000000"),
+                "message" to DslValue.Text("НАЙДИ ТЕЛЕФОН"),
+                "body" to DslValue.Text("НАЙДИ ТЕЛЕФОН")
+            )
+        )
+
+        assertEquals(DslValue.Text("НАЙДИ ТЕЛЕФОН"), recorded)
+    }
 }

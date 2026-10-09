@@ -8,6 +8,7 @@ import android.os.Build
 class AutomationBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED && intent.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
+        if (!AutomationStore.autoStartEnabled(context)) return
         if (AutomationStore.enabledScripts(context).isEmpty()) return
         val serviceIntent = Intent(context, AutomationForegroundService::class.java)
         try {

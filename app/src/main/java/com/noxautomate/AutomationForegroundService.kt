@@ -11,11 +11,18 @@ import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
+import android.hardware.camera2.CameraManager
+import android.location.LocationManager
+import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.provider.Settings
 import android.media.AudioManager
+import android.telephony.SmsManager
+import android.telephony.SmsMessage
 import android.widget.Toast
 import android.content.pm.PackageManager
 import androidx.core.app.NotificationCompat
@@ -109,10 +116,15 @@ class AutomationForegroundService : Service() {
         val supported = setOf(
             "battery.changed", "power.connected", "power.disconnected",
             "screen.on", "screen.off", "wifi.connected", "network.connected",
-            "network.disconnected", "time.every", "app.foreground"
+            "network.disconnected", "time.every", "app.foreground", "sms.received"
         )
         val unknown = handlers.map { it.event }.filterNot(supported::contains).distinct()
         if (unknown.isNotEmpty()) throw DslException("Неизвестные события: ${unknown.joinToString()}")
+        if (handlers.any { it.event == "sms.received" } &&
+            ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            throw DslException("Для обработчика sms.received требуется разрешение RECEIVE_SMS")
+        }
         if (handlers.any { it.event == "wifi.connected" } &&
             ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -143,6 +155,47 @@ class AutomationForegroundService : Service() {
         val events = flowSnapshot().flatMap { runtime ->
             runtime.program.statements.filterIsInstance<EventStmt>()
         }.map { it.event }.toSet()
+
+        if ("sms.received" in events) {
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    if (intent.action != "android.provider.Telephony.SMS_RECEIVED") return
+                    val pdus = intent.extras?.get("pdus") as? Array<*> ?: run {
+                        updateNotification("Получено SMS без данных для чтения")
+                        return
+                    }
+                    val format = intent.getStringExtra("format") ?: "3gpp"
+                    val messages = pdus.mapNotNull { pdu ->
+                        (pdu as? ByteArray)?.let { SmsMessage.createFromPdu(it, format) }
+                    }
+                    if (messages.isEmpty()) {
+                        updateNotification("Не удалось прочитать входящее SMS")
+                        return
+                    }
+                    val sender = messages.first().originatingAddress.orEmpty()
+                    val body = messages.joinToString(separator = "") { it.messageBody.orEmpty() }
+                    val allowedSender = AutomationStore.smsAllowedSender(this@AutomationForegroundService)
+                    if (allowedSender.isNotBlank() && normalizePhone(sender) != normalizePhone(allowedSender)) return
+                    emitEvent(
+                        "sms.received",
+                        mapOf(
+                            "sender" to DslValue.Text(sender),
+                            "message" to DslValue.Text(body),
+                            "body" to DslValue.Text(body),
+                            "timestamp_ms" to DslValue.Number(messages.first().timestampMillis.toDouble(), true)
+                        )
+                    )
+                }
+            }
+            val filter = IntentFilter("android.provider.Telephony.SMS_RECEIVED")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(receiver, filter, android.Manifest.permission.RECEIVE_SMS, null, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(receiver, filter, android.Manifest.permission.RECEIVE_SMS, null)
+            }
+            receivers += receiver
+        }
 
         if (events.any { it in setOf("battery.changed", "power.connected", "power.disconnected", "screen.on", "screen.off", "wifi.connected") }) {
             val filter = IntentFilter().apply {
@@ -269,6 +322,11 @@ class AutomationForegroundService : Service() {
 
     private fun flowSnapshot(): List<RunningFlow> = synchronized(flows) { flows.values.toList() }
 
+    private fun normalizePhone(value: String): String {
+        val digits = value.filter(Char::isDigit)
+        return if (value.trimStart().startsWith("+")) "+$digits" else digits
+    }
+
     private fun registerSystemReceiver(receiver: android.content.BroadcastReceiver, filter: IntentFilter) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
@@ -334,15 +392,75 @@ private class AndroidDslHost(private val context: Context) : DslHost {
                 Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, int(arg(0, "level")).coerceIn(0, 255))
                 DslValue.Null
             }
+            "device.get_volume" -> {
+                val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                val stream = when (text(arg(0, "stream")).lowercase()) {
+                    "music" -> AudioManager.STREAM_MUSIC; "ring" -> AudioManager.STREAM_RING
+                    "alarm" -> AudioManager.STREAM_ALARM; "notification" -> AudioManager.STREAM_NOTIFICATION
+                    "call" -> AudioManager.STREAM_VOICE_CALL; "system" -> AudioManager.STREAM_SYSTEM
+                    else -> throw DslException("Неизвестный аудиопоток")
+                }
+                DslValue.Number(manager.getStreamVolume(stream).toDouble(), true)
+            }
             "device.set_volume" -> {
                 val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 val stream = when (text(arg(0, "stream")).lowercase()) {
                     "music" -> AudioManager.STREAM_MUSIC; "ring" -> AudioManager.STREAM_RING
                     "alarm" -> AudioManager.STREAM_ALARM; "notification" -> AudioManager.STREAM_NOTIFICATION
+                    "call" -> AudioManager.STREAM_VOICE_CALL; "system" -> AudioManager.STREAM_SYSTEM
                     else -> throw DslException("Неизвестный аудиопоток")
                 }
                 val max = manager.getStreamMaxVolume(stream)
                 manager.setStreamVolume(stream, int(arg(1, "level")).coerceIn(0, max), 0)
+                DslValue.Null
+            }
+            "device.get_ringer_mode" -> {
+                val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                DslValue.Text(when (manager.ringerMode) {
+                    AudioManager.RINGER_MODE_SILENT -> "silent"
+                    AudioManager.RINGER_MODE_VIBRATE -> "vibrate"
+                    AudioManager.RINGER_MODE_NORMAL -> "normal"
+                    else -> "unknown"
+                })
+            }
+            "device.set_ringer_mode" -> {
+                val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                when (text(arg(0, "mode")).lowercase()) {
+                    "silent" -> manager.ringerMode = AudioManager.RINGER_MODE_SILENT
+                    "vibrate" -> manager.ringerMode = AudioManager.RINGER_MODE_VIBRATE
+                    "normal" -> manager.ringerMode = AudioManager.RINGER_MODE_NORMAL
+                    else -> throw DslException("Неизвестный режим звонка: silent, vibrate, normal")
+                }
+                DslValue.Null
+            }
+            "device.vibrate" -> {
+                if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.VIBRATE) != PackageManager.PERMISSION_GRANTED) {
+                    throw DslException("Для device.vibrate требуется разрешение VIBRATE")
+                }
+                val duration = int(arg(0, "duration_ms")).coerceAtLeast(0)
+                val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator.vibrate(VibrationEffect.createOneShot(duration.toLong(), VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator.vibrate(duration.toLong())
+                }
+                DslValue.Null
+            }
+            "device.flash_lamp" -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                    throw DslException("device.flash_lamp требует Android 6+")
+                }
+                val cameraManager = context.getSystemService(CameraManager::class.java)
+                val cameraId = cameraManager.cameraIdList.firstOrNull() ?: throw DslException("Фонарик недоступен")
+                val enabled = bool(arg(0, "enabled"))
+                cameraManager.setTorchMode(cameraId, enabled)
+                DslValue.Bool(enabled)
+            }
+            "device.set_screen_timeout" -> {
+                if (!Settings.System.canWrite(context)) throw DslException("Нет разрешения WRITE_SETTINGS")
+                val timeout = int(arg(0, "ms")).coerceAtLeast(0)
+                Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_OFF_TIMEOUT, timeout)
                 DslValue.Null
             }
             "wifi.is_connected" -> {
@@ -394,6 +512,48 @@ private class AndroidDslHost(private val context: Context) : DslHost {
                 if (ms !in 0..60_000) throw DslException("system.sleep ограничен 60000 мс")
                 Thread.sleep(ms)
                 DslValue.Null
+            }
+            "location.get_last_known_coordinates" -> {
+                if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+                    ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    throw DslException("Для location.get_last_known_coordinates требуется разрешение ACCESS_FINE_LOCATION или ACCESS_COARSE_LOCATION")
+                }
+                val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                val provider = locationManager.getProviders(true).firstOrNull { it == LocationManager.GPS_PROVIDER }
+                    ?: locationManager.getProviders(true).firstOrNull()
+                    ?: throw DslException("Нет доступного провайдера геолокации")
+                val location = runCatching { locationManager.getLastKnownLocation(provider) }.getOrNull()
+                val latitude = location?.latitude ?: 0.0
+                val longitude = location?.longitude ?: 0.0
+                val accuracy = location?.accuracy ?: 0.0
+                DslValue.Mapping(mutableMapOf(
+                    DslValue.Text("latitude") to DslValue.Number(latitude, latitude % 1.0 == 0.0),
+                    DslValue.Text("longitude") to DslValue.Number(longitude, longitude % 1.0 == 0.0),
+                    DslValue.Text("accuracy") to DslValue.Number(accuracy, accuracy % 1.0 == 0.0),
+                    DslValue.Text("provider") to DslValue.Text(location?.provider ?: "unknown")
+                ))
+            }
+            "location.get_last_known_location" -> invoke("location.get_last_known_coordinates", positional, named)
+            "sms.compose" -> {
+                val phone = text(arg(0, "phone"))
+                val message = text(named["message"] ?: positional.getOrNull(1) ?: DslValue.Text(""))
+                val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(phone)}")).apply {
+                    putExtra("sms_body", message)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+                DslValue.Bool(true)
+            }
+            "sms.send" -> {
+                if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+                    throw DslException("Для sms.send требуется разрешение SEND_SMS")
+                }
+                val phone = text(arg(0, "phone"))
+                val message = text(named["message"] ?: positional.getOrNull(1) ?: DslValue.Text(""))
+                val smsManager = SmsManager.getDefault()
+                smsManager.sendTextMessage(phone, null, message, null, null)
+                DslValue.Bool(true)
             }
             "app.launch" -> {
                 val packageName = text(arg(0, "package_name"))

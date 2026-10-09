@@ -23,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.*
@@ -33,11 +34,18 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
 import org.json.JSONObject
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+        val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+            if (results[android.Manifest.permission.RECEIVE_SMS] == true &&
+                AutomationStore.enabledScripts(this).isNotEmpty()
+            ) {
+                refreshAutomationService()
+            }
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val required = listOf(
                 android.Manifest.permission.POST_NOTIFICATIONS,
@@ -71,6 +79,10 @@ class MainActivity : ComponentActivity() {
             }
             var nextScriptId by remember { mutableIntStateOf(scripts.size + 1) }
             var runStatus by remember { mutableStateOf(RunStatus.read(this@MainActivity)) }
+            var smsNumber by remember { mutableStateOf("") }
+            var autoStartEnabled by remember { mutableStateOf(AutomationStore.autoStartEnabled(this@MainActivity)) }
+            var allowedSmsSender by remember { mutableStateOf(AutomationStore.smsAllowedSender(this@MainActivity)) }
+            val activityScope = rememberCoroutineScope()
             val script = scripts[selectedScript].orEmpty()
             LaunchedEffect(scripts.toMap()) {
                 AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
@@ -188,6 +200,150 @@ class MainActivity : ComponentActivity() {
                                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                             }) { Text("Спец. возможности") }
                         }
+                        Text("Поиск моего телефона", style = MaterialTheme.typography.titleMedium)
+                        OutlinedTextField(
+                            value = smsNumber,
+                            onValueChange = { smsNumber = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Номер для SMS с моими координатами") },
+                            singleLine = true
+                        )
+                        Row(
+                            Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(onClick = {
+                                val missing = listOf(
+                                    android.Manifest.permission.CAMERA,
+                                    android.Manifest.permission.POST_NOTIFICATIONS
+                                ).filter {
+                                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                        ContextCompat.checkSelfPermission(this@MainActivity, it) != PackageManager.PERMISSION_GRANTED
+                                    || it == android.Manifest.permission.CAMERA &&
+                                        ContextCompat.checkSelfPermission(this@MainActivity, it) != PackageManager.PERMISSION_GRANTED
+                                }
+                                if (missing.isNotEmpty()) {
+                                    permissionLauncher.launch(missing.toTypedArray())
+                                    RunStatus.write(this@MainActivity, "Разрешите камеру и уведомления, затем нажмите «Найти» снова")
+                                } else {
+                                    val policy = getSystemService(android.app.NotificationManager::class.java)
+                                    if (!policy.isNotificationPolicyAccessGranted) {
+                                        RunStatus.write(this@MainActivity, "Нужно разрешение для временного выхода из режима «Не беспокоить»")
+                                        startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+                                    } else {
+                                        startForegroundService(
+                                            Intent(this@MainActivity, AutomationForegroundService::class.java)
+                                                .setAction(AutomationForegroundService.ACTION_FIND_START)
+                                        )
+                                    }
+                                }
+                            }) { Text("Найти") }
+                            Button(onClick = {
+                                startService(
+                                    Intent(this@MainActivity, AutomationForegroundService::class.java)
+                                        .setAction(AutomationForegroundService.ACTION_FIND_STOP)
+                                )
+                            }) { Text("Остановить поиск") }
+                        }
+                        Button(
+                            onClick = {
+                                if (smsNumber.isBlank()) {
+                                    RunStatus.write(this@MainActivity, "Введите номер телефона для SMS")
+                                } else {
+                                    activityScope.launch {
+                                        try {
+                                            val location = LocationSharing.currentLocation(this@MainActivity)
+                                            if (location == null) {
+                                                RunStatus.write(this@MainActivity, "Не удалось определить геопозицию")
+                                            } else {
+                                                val message = "Мои координаты: https://maps.google.com/?q=${location.latitude},${location.longitude}"
+                                                val sms = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(smsNumber)}"))
+                                                    .putExtra("sms_body", message)
+                                                if (sms.resolveActivity(packageManager) == null) {
+                                                    RunStatus.write(this@MainActivity, "На устройстве нет приложения для SMS")
+                                                } else {
+                                                    startActivity(Intent.createChooser(sms, "Отправить координаты по SMS"))
+                                                }
+                                            }
+                                        } catch (error: Exception) {
+                                            RunStatus.write(this@MainActivity, "Не удалось получить координаты: ${error.message}")
+                                        }
+                                    }
+                                }
+                            }
+                        ) { Text("Поделиться координатами по SMS") }
+                        Text(
+                            "Входящие SMS обрабатываются только пока запущен сервис и сценарий с on sms.received. " +
+                                "Запросите разрешение, если хотите передавать текст сообщения в условия сценария."
+                        )
+                        Button(
+                            onClick = {
+                                if (ContextCompat.checkSelfPermission(
+                                        this@MainActivity,
+                                        android.Manifest.permission.RECEIVE_SMS
+                                    ) == PackageManager.PERMISSION_GRANTED
+                                ) {
+                                    if (enabledScripts.isEmpty()) {
+                                        RunStatus.write(this@MainActivity, "Сначала включите сценарий с on sms.received")
+                                    } else {
+                                        refreshAutomationService()
+                                        RunStatus.write(this@MainActivity, "Обработка входящих SMS включена")
+                                    }
+                                } else {
+                                    permissionLauncher.launch(arrayOf(android.Manifest.permission.RECEIVE_SMS))
+                                }
+                            }
+                        ) { Text("Разрешить чтение входящих SMS") }
+                        Text("Настройки фоновой работы", style = MaterialTheme.typography.titleMedium)
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Запускать сценарии после перезагрузки")
+                                Text(
+                                    "Запускаются только сценарии, отмеченные «Авто: вкл.»",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            Switch(
+                                checked = autoStartEnabled,
+                                onCheckedChange = { enabled ->
+                                    autoStartEnabled = enabled
+                                    AutomationStore.setAutoStartEnabled(this@MainActivity, enabled)
+                                }
+                            )
+                        }
+                        OutlinedTextField(
+                            value = allowedSmsSender,
+                            onValueChange = {
+                                allowedSmsSender = it
+                                AutomationStore.setSmsAllowedSender(this@MainActivity, it)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Разрешённый отправитель SMS (необязательно)") },
+                            supportingText = {
+                                Text("Пустое поле: принимать SMS от любых номеров. Заполнено: обрабатывать только этот номер.")
+                            },
+                            singleLine = true
+                        )
+                        Button(
+                            onClick = {
+                                try {
+                                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                                } catch (error: Exception) {
+                                    RunStatus.write(
+                                        this@MainActivity,
+                                        "Не удалось открыть настройки оптимизации батареи: ${error.message}"
+                                    )
+                                }
+                            }
+                        ) { Text("Настройки оптимизации батареи") }
+                        Text(
+                            "Сервис остаётся активен при закрытии экрана приложения, пока есть включённые сценарии. " +
+                                "Для надёжной работы разрешите фоновую работу в настройках батареи устройства. " +
+                                "Принудительная остановка приложения остановит автоматизацию до следующего ручного запуска."
+                        )
                         Text("Вывод: $runStatus", style = MaterialTheme.typography.bodyMedium)
                     }
                 }
