@@ -1027,7 +1027,7 @@ private class AndroidDslHost(
                     DslValue.Text("latitude") to DslValue.Number(latitude, latitude % 1.0 == 0.0),
                     DslValue.Text("longitude") to DslValue.Number(longitude, longitude % 1.0 == 0.0),
                     DslValue.Text("accuracy") to DslValue.Number(accuracy, accuracy % 1.0 == 0.0),
-                    DslValue.Text("provider") to DslValue.Text(location.provider),
+                    DslValue.Text("provider") to DslValue.Text(location.provider.orEmpty()),
                     DslValue.Text("time_ms") to DslValue.Number(location.time.toDouble(), true)
                 ))
             }
@@ -1149,9 +1149,6 @@ private class AndroidDslHost(
             throw DslException("Путь файла должен быть относительным к закрытому хранилищу приложения")
         }
 
-        private fun mappingOf(vararg values: Pair<String, DslValue>) = DslValue.Mapping(
-            values.associateTo(mutableMapOf()) { (key, value) -> DslValue.Text(key) to value }
-        )
         val root = context.filesDir.canonicalFile
         val file = File(root, path).canonicalFile
         if (!file.path.startsWith(root.path + File.separator)) {
@@ -1159,6 +1156,10 @@ private class AndroidDslHost(
         }
         return file
     }
+
+    private fun mappingOf(vararg values: Pair<String, DslValue>) = DslValue.Mapping(
+        values.associateTo(mutableMapOf()) { (key, value) -> DslValue.Text(key) to value }
+    )
 
     private fun recordAudio(file: File, durationMs: Int) {
         val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(context) else {
@@ -1216,7 +1217,7 @@ private class AndroidDslHost(
             manager.unregisterListener(listener)
         }
         return DslValue.Sequence(
-            sample.orEmpty().map { DslValue.Number(it.toDouble(), false) }.toMutableList()
+            (sample ?: FloatArray(0)).map { DslValue.Number(it.toDouble(), false) }.toMutableList()
         )
     }
 
