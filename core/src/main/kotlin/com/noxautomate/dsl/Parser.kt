@@ -17,6 +17,7 @@ class Parser(private val tokens: List<Token>) {
         match(TokenType.IF) -> ifStatement(previous())
         match(TokenType.WHILE) -> whileStatement(previous())
         match(TokenType.FOR) -> forStatement(previous())
+        match(TokenType.PARALLEL) -> parallelStatement(previous())
         match(TokenType.ON) -> eventStatement(previous())
         match(TokenType.BREAK) -> { endStatement(); BreakStmt }
         match(TokenType.CONTINUE) -> { endStatement(); ContinueStmt }
@@ -61,6 +62,24 @@ class Parser(private val tokens: List<Token>) {
         consume(TokenType.IN, "Ожидалось 'in'")
         val iterable = expression()
         return ForStmt(name, iterable, block(token))
+    }
+
+    private fun parallelStatement(token: Token): Stmt {
+        consume(TokenType.COLON, "Ожидалось ':' после parallel")
+        consume(TokenType.NEWLINE, "Ожидался перевод строки после 'parallel:'")
+        consume(TokenType.INDENT, "Ожидались параллельные ветки с отступом")
+        val branches = mutableListOf<Block>()
+        skipNewlines()
+        while (!check(TokenType.DEDENT) && !check(TokenType.EOF)) {
+            val branch = consume(TokenType.BRANCH, "Внутри parallel ожидается 'branch:'")
+            branches += block(branch)
+            skipNewlines()
+        }
+        if (branches.size < 2) {
+            throw DslException("В parallel требуется минимум две ветки branch:", token.position)
+        }
+        consume(TokenType.DEDENT, "Ожидался конец parallel")
+        return ParallelStmt(branches)
     }
 
     private fun eventStatement(token: Token): Stmt {

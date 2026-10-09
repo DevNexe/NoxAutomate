@@ -3,6 +3,8 @@ package com.noxautomate.dsl
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class DslTest {
     @Test
@@ -188,5 +190,66 @@ class DslTest {
         )
 
         assertEquals(DslValue.Text("НАЙДИ ТЕЛЕФОН"), recorded)
+    }
+
+    @Test
+    fun parallelBranchesRunConcurrentlyWithIndependentVariableSnapshots() {
+        val program = Parser(Lexer("""
+            value = 1
+            parallel:
+                branch:
+                    value = 2
+                    system.sync(name="first")
+                branch:
+                    system.sync(name="second")
+                    system.record(value=value)
+            system.record(value=value)
+        """.trimIndent()).tokenize()).parse()
+        val bothBranchesStarted = CountDownLatch(2)
+        val recorded = java.util.Collections.synchronizedList(mutableListOf<DslValue>())
+        val interpreter = Interpreter(object : DslHost {
+            override fun invoke(function: String, positional: List<DslValue>, named: Map<String, DslValue>): DslValue {
+                when (function) {
+                    "system.sync" -> {
+                        bothBranchesStarted.countDown()
+                        check(bothBranchesStarted.await(2, TimeUnit.SECONDS)) { "parallel branches did not overlap" }
+                    }
+                    "system.record" -> recorded += named.getValue("value")
+                }
+                return DslValue.Null
+            }
+        })
+
+        interpreter.execute(program)
+
+        assertEquals(
+            listOf(DslValue.Number(1.0, true), DslValue.Number(1.0, true)),
+            recorded.toList()
+        )
+    }
+
+    @Test
+    fun parallelRequiresAtLeastTwoBranches() {
+        assertFailsWith<DslException> {
+            Parser(Lexer("""
+                parallel:
+                    branch:
+                        system.record(value=1)
+            """.trimIndent()).tokenize()).parse()
+        }
+    }
+
+    @Test
+    fun flowStartIsExposedAsABuiltinDslCall() {
+        val program = Parser(Lexer("flow.start(name=\"Secondary\")").tokenize()).parse()
+        var startedName: String? = null
+        Interpreter(object : DslHost {
+            override fun invoke(function: String, positional: List<DslValue>, named: Map<String, DslValue>): DslValue {
+                assertEquals("flow.start", function)
+                startedName = (named.getValue("name") as DslValue.Text).value
+                return DslValue.Bool(true)
+            }
+        }).execute(program)
+        assertEquals("Secondary", startedName)
     }
 }

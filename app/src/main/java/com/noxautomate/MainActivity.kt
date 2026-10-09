@@ -10,23 +10,21 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -35,26 +33,23 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.Shapes
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
-import androidx.work.workDataOf
 import org.json.JSONObject
-import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = android.graphics.Color.rgb(11, 16, 21)
-        window.navigationBarColor = android.graphics.Color.rgb(11, 16, 21)
+        window.statusBarColor = android.graphics.Color.rgb(17, 17, 17)
+        window.navigationBarColor = android.graphics.Color.rgb(17, 17, 17)
         window.decorView.systemUiVisibility = 0
         val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
             if (results[android.Manifest.permission.RECEIVE_SMS] == true &&
@@ -80,8 +75,7 @@ class MainActivity : ComponentActivity() {
                 if (json != null) {
                     val saved = JSONObject(json)
                     saved.keys().forEach { key -> restored[key] = saved.getString(key) }
-                }
-                if (restored.isEmpty()) {
+                } else {
                     restored["Сценарий 1"] =
                         "on battery.changed(threshold=20, direction=\"below\"):\n" +
                             "    system.notify(title=\"Battery low\", body=\"Please charge\")"
@@ -89,28 +83,36 @@ class MainActivity : ComponentActivity() {
                 restored
             }
             var selectedScript by remember {
-                mutableStateOf(preferences.getString("selected_script", null)?.takeIf { it in scripts } ?: scripts.keys.first())
+                mutableStateOf(preferences.getString("selected_script", null)?.takeIf { it in scripts } ?: scripts.keys.firstOrNull().orEmpty())
             }
             val enabledScripts = remember {
                 mutableStateListOf<String>().also { it.addAll(AutomationStore.enabledScripts(this@MainActivity)) }
             }
             var nextScriptId by remember { mutableIntStateOf(scripts.size + 1) }
             var runStatus by remember { mutableStateOf(RunStatus.read(this@MainActivity)) }
-            var smsNumber by remember { mutableStateOf("") }
+            val runLogs = remember { mutableStateListOf<String>().also { it.addAll(RunStatus.readLogs(this@MainActivity)) } }
             var autoStartEnabled by remember { mutableStateOf(AutomationStore.autoStartEnabled(this@MainActivity)) }
             var allowedSmsSender by remember { mutableStateOf(AutomationStore.smsAllowedSender(this@MainActivity)) }
-            val activityScope = rememberCoroutineScope()
+            var detailVisible by remember { mutableStateOf(false) }
+            var editorVisible by remember { mutableStateOf(false) }
             val script = scripts[selectedScript].orEmpty()
             LaunchedEffect(scripts.toMap()) {
                 AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
             }
             LaunchedEffect(selectedScript) {
-                preferences.edit().putString("selected_script", selectedScript).apply()
+                if (selectedScript in scripts) preferences.edit().putString("selected_script", selectedScript).apply()
+            }
+            LaunchedEffect(Unit) {
+                if (enabledScripts.isNotEmpty() && !AutomationForegroundService.isActive) {
+                    refreshAutomationService()
+                }
             }
             DisposableEffect(Unit) {
                 val receiver = object : android.content.BroadcastReceiver() {
                     override fun onReceive(context: android.content.Context, intent: Intent) {
                         runStatus = RunStatus.read(context)
+                        runLogs.clear()
+                        runLogs.addAll(RunStatus.readLogs(context))
                     }
                 }
                 ContextCompat.registerReceiver(
@@ -120,172 +122,93 @@ class MainActivity : ComponentActivity() {
                 onDispose { unregisterReceiver(receiver) }
             }
             var selectedTab by remember { mutableStateOf(MainTab.SCRIPTS) }
+            BackHandler(enabled = editorVisible || detailVisible) {
+                if (editorVisible) editorVisible = false else detailVisible = false
+            }
             NoxTheme {
                 Scaffold(
                     containerColor = MaterialTheme.colorScheme.background,
                     bottomBar = {
-                        NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
-                            MainTab.entries.forEach { tab ->
-                                NavigationBarItem(
-                                    selected = selectedTab == tab,
-                                    onClick = { selectedTab = tab },
-                                    icon = { Text(tab.shortLabel) },
-                                    label = { Text(tab.label) }
-                                )
+                        if (!detailVisible && !editorVisible) {
+                            NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                                MainTab.entries.forEach { tab ->
+                                    NavigationBarItem(
+                                        selected = selectedTab == tab,
+                                        onClick = { selectedTab = tab },
+                                        icon = { Text(tab.shortLabel) },
+                                        label = { Text(tab.label) }
+                                    )
+                                }
                             }
                         }
                     }
                 ) { contentPadding ->
-                    Column(
-                        Modifier.fillMaxSize().padding(contentPadding).padding(horizontal = 18.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text("NOX AUTOMATE", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                            Text(tabTitle(selectedTab), style = MaterialTheme.typography.headlineSmall)
-                        }
-                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-                            Text(
-                                text = runStatus,
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                        }
-                        when (selectedTab) {
-                            MainTab.SCRIPTS -> ScriptsScreen(
-                                scripts = scripts,
-                                enabledScripts = enabledScripts,
-                                selectedScript = selectedScript,
-                                onSelect = {
-                                    selectedScript = it
-                                    selectedTab = MainTab.EDITOR
-                                },
-                                onToggle = { name -> toggleScript(name, enabledScripts, scripts) },
-                                onAdd = {
-                                    while ("Сценарий $nextScriptId" in scripts) nextScriptId++
-                                    val name = "Сценарий ${nextScriptId++}"
-                                    scripts[name] = ""
-                                    selectedScript = name
-                                    selectedTab = MainTab.EDITOR
-                                },
-                                onDelete = { name ->
-                                    if (scripts.size > 1) {
-                                        scripts.remove(name)
-                                        enabledScripts.remove(name)
-                                        AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
-                                        AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
-                                        if (selectedScript == name) selectedScript = scripts.keys.first()
-                                        if (enabledScripts.isEmpty()) {
-                                            stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
-                                        } else {
-                                            refreshAutomationService()
-                                        }
+                    when {
+                        editorVisible -> ScriptEditorScreen(
+                            scriptName = selectedScript,
+                            source = script,
+                            contentPadding = contentPadding,
+                            onBack = { editorVisible = false },
+                            onSave = { updatedSource ->
+                                scripts[selectedScript] = updatedSource
+                                AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
+                                if (selectedScript in enabledScripts) refreshAutomationService()
+                                RunStatus.write(this@MainActivity, "Сценарий «$selectedScript» сохранён")
+                            },
+                            onDelete = {
+                                deleteScript(selectedScript, scripts, enabledScripts)
+                                selectedScript = scripts.keys.firstOrNull().orEmpty()
+                                editorVisible = false
+                                detailVisible = false
+                            }
+                        )
+                        detailVisible -> ScriptDetailScreen(
+                            scriptName = selectedScript,
+                            isRunning = selectedScript in enabledScripts,
+                            logs = runLogs,
+                            contentPadding = contentPadding,
+                            onBack = { detailVisible = false },
+                            onRun = { setScriptEnabled(selectedScript, true, enabledScripts, scripts) },
+                            onStop = { setScriptEnabled(selectedScript, false, enabledScripts, scripts) },
+                            onEdit = { editorVisible = true },
+                            onDelete = {
+                                deleteScript(selectedScript, scripts, enabledScripts)
+                                selectedScript = scripts.keys.firstOrNull().orEmpty()
+                                detailVisible = false
+                            }
+                        )
+                        else -> Column(
+                            Modifier.fillMaxSize().padding(contentPadding).padding(horizontal = 18.dp, vertical = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text("NOX AUTOMATE", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                                Text(tabTitle(selectedTab), style = MaterialTheme.typography.headlineSmall)
+                            }
+                            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                                Text(
+                                    text = runStatus,
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                            when (selectedTab) {
+                                MainTab.SCRIPTS -> ScriptsScreen(
+                                    scripts = scripts,
+                                    enabledScripts = enabledScripts,
+                                    onSelect = {
+                                        selectedScript = it
+                                        detailVisible = true
+                                    },
+                                    onAdd = {
+                                        while ("Сценарий $nextScriptId" in scripts) nextScriptId++
+                                        val name = "Сценарий ${nextScriptId++}"
+                                        scripts[name] = ""
+                                        selectedScript = name
+                                        editorVisible = true
                                     }
-                                }
-                            )
-                            MainTab.EDITOR -> EditorScreen(
-                                scripts = scripts,
-                                selectedScript = selectedScript,
-                                onSelect = { selectedScript = it },
-                                onScriptChange = {
-                                    scripts[selectedScript] = it
-                                    AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
-                                },
-                                onRun = {
-                                    try {
-                                        AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
-                                        if (selectedScript !in enabledScripts) enabledScripts.add(selectedScript)
-                                        AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
-                                        startForegroundService(Intent(this@MainActivity, AutomationForegroundService::class.java))
-                                    } catch (error: Exception) {
-                                        RunStatus.write(this@MainActivity, "Ошибка запуска сервиса: ${error.message}")
-                                    }
-                                },
-                                onStop = {
-                                    enabledScripts.clear()
-                                    AutomationStore.setEnabledScripts(this@MainActivity, emptySet())
-                                    stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
-                                    RunStatus.write(this@MainActivity, "Сервис остановлен")
-                                },
-                                onRunOnce = {
-                                    val request = OneTimeWorkRequestBuilder<ScriptWorker>()
-                                        .setInputData(workDataOf(AutomationForegroundService.EXTRA_SCRIPT to script))
-                                        .build()
-                                    WorkManager.getInstance(this@MainActivity).enqueue(request)
-                                    RunStatus.write(this@MainActivity, "Разовый запуск поставлен в очередь")
-                                },
-                                onDelete = {
-                                    if (scripts.size > 1) {
-                                        scripts.remove(selectedScript)
-                                        enabledScripts.remove(selectedScript)
-                                        AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
-                                        AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
-                                        selectedScript = scripts.keys.first()
-                                        if (enabledScripts.isEmpty()) {
-                                            stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
-                                        } else {
-                                            refreshAutomationService()
-                                        }
-                                    }
-                                }
-                            )
-                            MainTab.DEVICE -> DeviceScreen(
-                                smsNumber = smsNumber,
-                                onSmsNumberChange = { smsNumber = it },
-                                onFind = {
-                                    val missing = buildList {
-                                        if (ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-                                            add(android.Manifest.permission.CAMERA)
-                                        }
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                            ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-                                        ) {
-                                            add(android.Manifest.permission.POST_NOTIFICATIONS)
-                                        }
-                                    }
-                                    if (missing.isNotEmpty()) {
-                                        permissionLauncher.launch(missing.toTypedArray())
-                                        RunStatus.write(this@MainActivity, "Разреши запрошенные права и нажми «Найти телефон» ещё раз")
-                                    } else {
-                                        startForegroundService(
-                                            Intent(this@MainActivity, AutomationForegroundService::class.java)
-                                                .setAction(AutomationForegroundService.ACTION_FIND_START)
-                                        )
-                                    }
-                                },
-                                onStopFind = {
-                                    startForegroundService(
-                                        Intent(this@MainActivity, AutomationForegroundService::class.java)
-                                            .setAction(AutomationForegroundService.ACTION_FIND_STOP)
-                                    )
-                                },
-                                onShareLocation = {
-                                    if (smsNumber.isBlank()) {
-                                        RunStatus.write(this@MainActivity, "Введи номер телефона для SMS")
-                                    } else {
-                                        activityScope.launch {
-                                            try {
-                                                val location = LocationSharing.currentLocation(this@MainActivity)
-                                                if (location == null) {
-                                                    RunStatus.write(this@MainActivity, "Не удалось определить геопозицию")
-                                                } else {
-                                                    val message = "Мои координаты: https://maps.google.com/?q=${location.latitude},${location.longitude}"
-                                                    val sms = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(smsNumber)}"))
-                                                        .putExtra("sms_body", message)
-                                                    if (sms.resolveActivity(packageManager) == null) {
-                                                        RunStatus.write(this@MainActivity, "На устройстве нет приложения для SMS")
-                                                    } else {
-                                                        startActivity(Intent.createChooser(sms, "Отправить координаты по SMS"))
-                                                    }
-                                                }
-                                            } catch (error: Exception) {
-                                                RunStatus.write(this@MainActivity, "Не удалось получить координаты: ${error.message}")
-                                            }
-                                        }
-                                    }
-                                }
-                            )
-                            MainTab.SETTINGS -> SettingsScreen(
+                                )
+                                MainTab.SETTINGS -> SettingsScreen(
                                 autoStartEnabled = autoStartEnabled,
                                 allowedSmsSender = allowedSmsSender,
                                 onAutoStartChange = {
@@ -308,6 +231,25 @@ class MainActivity : ComponentActivity() {
                                         permissionLauncher.launch(arrayOf(android.Manifest.permission.RECEIVE_SMS))
                                     }
                                 },
+                                onRequestDevicePermissions = {
+                                    val requested = buildList {
+                                        add(android.Manifest.permission.RECORD_AUDIO)
+                                        add(android.Manifest.permission.READ_PHONE_STATE)
+                                        add(android.Manifest.permission.READ_CONTACTS)
+                                        add(android.Manifest.permission.READ_CALENDAR)
+                                        add(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                            add(android.Manifest.permission.BLUETOOTH_CONNECT)
+                                        }
+                                    }.filter {
+                                        ContextCompat.checkSelfPermission(this@MainActivity, it) != PackageManager.PERMISSION_GRANTED
+                                    }
+                                    if (requested.isEmpty()) {
+                                        RunStatus.write(this@MainActivity, "Все запрошенные разрешения уже выданы")
+                                    } else {
+                                        permissionLauncher.launch(requested.toTypedArray())
+                                    }
+                                },
                                 onWriteSettings = {
                                     startActivity(
                                         Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
@@ -322,7 +264,8 @@ class MainActivity : ComponentActivity() {
                                         RunStatus.write(this@MainActivity, "Не удалось открыть настройки батареи: ${error.message}")
                                     }
                                 }
-                            )
+                                )
+                            }
                         }
                     }
                 }
@@ -338,59 +281,85 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun toggleScript(name: String, enabledScripts: MutableList<String>, scripts: Map<String, String>) {
-        if (name in enabledScripts) enabledScripts.remove(name) else enabledScripts.add(name)
+    private fun setScriptEnabled(
+        name: String,
+        enabled: Boolean,
+        enabledScripts: MutableList<String>,
+        scripts: Map<String, String>
+    ) {
+        if (name !in scripts) return
+        if (enabled) {
+            if (name !in enabledScripts) enabledScripts.add(name)
+        } else {
+            enabledScripts.remove(name)
+        }
         AutomationStore.setEnabledScripts(this, enabledScripts.toSet())
         AutomationStore.saveScripts(this, scripts)
         if (enabledScripts.isEmpty()) {
             stopService(Intent(this, AutomationForegroundService::class.java))
-            RunStatus.write(this, "Все сценарии автоматизации остановлены")
+            RunStatus.write(this, "Сценарий «$name» остановлен")
         } else {
             refreshAutomationService()
-            RunStatus.write(this, "Активные сценарии обновлены")
+            RunStatus.write(this, if (enabled) "Сценарий «$name» запущен" else "Сценарий «$name» остановлен")
         }
+    }
+
+    private fun deleteScript(
+        name: String,
+        scripts: MutableMap<String, String>,
+        enabledScripts: MutableList<String>
+    ) {
+        if (scripts.remove(name) == null) return
+        enabledScripts.remove(name)
+        AutomationStore.setEnabledScripts(this, enabledScripts.toSet())
+        AutomationStore.saveScripts(this, scripts.toMap())
+        if (enabledScripts.isEmpty()) {
+            stopService(Intent(this, AutomationForegroundService::class.java))
+        } else {
+            refreshAutomationService()
+        }
+        RunStatus.write(this, "Сценарий «$name» удалён")
     }
 }
 
 private enum class MainTab(val label: String, val shortLabel: String) {
     SCRIPTS("Сценарии", "●"),
-    EDITOR("Редактор", "✎"),
-    DEVICE("Устройство", "◉"),
     SETTINGS("Настройки", "⚙")
 }
 
 private fun tabTitle(tab: MainTab): String = when (tab) {
     MainTab.SCRIPTS -> "Мои сценарии"
-    MainTab.EDITOR -> "Редактор кода"
-    MainTab.DEVICE -> "Инструменты"
     MainTab.SETTINGS -> "Настройки"
 }
 
 @Composable
 private fun NoxTheme(content: @Composable () -> Unit) {
     val colors = darkColorScheme(
-        primary = Color(0xFF80CBC4),
-        onPrimary = Color(0xFF06201D),
-        secondary = Color(0xFF82B1FF),
-        background = Color(0xFF0B1015),
-        surface = Color(0xFF111820),
-        surfaceVariant = Color(0xFF1B2731),
-        onSurface = Color(0xFFE7EDF2),
-        onSurfaceVariant = Color(0xFFB5C2CC),
-        outline = Color(0xFF45545F)
+        primary = Color(0xFF999999),
+        onPrimary = Color(0xFF111111),
+        secondary = Color(0xFF666666),
+        background = Color(0xFF111111),
+        surface = Color(0xFF1A1A1A),
+        surfaceVariant = Color(0xFF202020),
+        onSurface = Color(0xFFE0E0E0),
+        onSurfaceVariant = Color(0xFF888888),
+        outline = Color(0xFF333333),
+        tertiary = Color(0xFF555555)
     )
-    MaterialTheme(colorScheme = colors, content = content)
+    val shapes = Shapes(
+        small = RoundedCornerShape(8.dp),
+        medium = RoundedCornerShape(10.dp),
+        large = RoundedCornerShape(10.dp)
+    )
+    MaterialTheme(colorScheme = colors, shapes = shapes, content = content)
 }
 
 @Composable
 private fun ColumnScope.ScriptsScreen(
     scripts: Map<String, String>,
     enabledScripts: List<String>,
-    selectedScript: String,
     onSelect: (String) -> Unit,
-    onToggle: (String) -> Unit,
-    onAdd: () -> Unit,
-    onDelete: (String) -> Unit
+    onAdd: () -> Unit
 ) {
     Column(
         Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
@@ -402,17 +371,21 @@ private fun ColumnScope.ScriptsScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Button(onClick = onAdd, modifier = Modifier.fillMaxWidth()) { Text("＋  Новый сценарий") }
+        if (scripts.isEmpty()) {
+            Text(
+                "Пока нет сценариев. Создай новый, чтобы начать автоматизацию.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
         scripts.forEach { (name, source) ->
             Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = if (name == selectedScript) MaterialTheme.colorScheme.surfaceVariant
-                    else MaterialTheme.colorScheme.surface
-                ),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 onClick = { onSelect(name) }
             ) {
                 Column(
                     Modifier.fillMaxWidth().padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Row(
                         Modifier.fillMaxWidth(),
@@ -421,26 +394,20 @@ private fun ColumnScope.ScriptsScreen(
                         Column(Modifier.weight(1f)) {
                             Text(name, style = MaterialTheme.typography.titleMedium)
                             Text(
-                                if (name in enabledScripts) "Работает в фоне" else "Отключён",
+                                if (name in enabledScripts) "Запущен" else "Остановлен",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        Switch(checked = name in enabledScripts, onCheckedChange = { onToggle(name) })
+                        Text("›", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Text(
-                        source.lineSequence().firstOrNull()?.take(72)?.ifBlank { "Пустой сценарий" }
+                        source.lineSequence().firstOrNull()?.take(90)?.ifBlank { "Пустой сценарий" }
                             ?: "Пустой сценарий",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 2
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilledTonalButton(onClick = { onSelect(name) }) { Text("Редактировать") }
-                        if (scripts.size > 1) {
-                            OutlinedButton(onClick = { onDelete(name) }) { Text("Удалить") }
-                        }
-                    }
                 }
             }
         }
@@ -448,113 +415,119 @@ private fun ColumnScope.ScriptsScreen(
 }
 
 @Composable
-private fun ColumnScope.EditorScreen(
-    scripts: Map<String, String>,
-    selectedScript: String,
-    onSelect: (String) -> Unit,
-    onScriptChange: (String) -> Unit,
+private fun ScriptDetailScreen(
+    scriptName: String,
+    isRunning: Boolean,
+    logs: List<String>,
+    contentPadding: androidx.compose.foundation.layout.PaddingValues,
+    onBack: () -> Unit,
     onRun: () -> Unit,
     onStop: () -> Unit,
-    onRunOnce: () -> Unit,
+    onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
-    Column(
-        Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        BoxDropdown(
-            selectedScript = selectedScript,
-            scriptNames = scripts.keys.toList(),
-            expanded = menuExpanded,
-            onExpandedChange = { menuExpanded = it },
-            onSelect = {
-                onSelect(it)
-                menuExpanded = false
+    Column(Modifier.fillMaxSize().padding(contentPadding).padding(horizontal = 18.dp, vertical = 8.dp)) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                TextButton(onClick = onBack) { Text("←") }
+                Text(scriptName, style = MaterialTheme.typography.titleMedium)
             }
-        )
+            BoxMenuButton(
+                expanded = menuExpanded,
+                onExpandedChange = { menuExpanded = it },
+                onDelete = {
+                    menuExpanded = false
+                    onDelete()
+                },
+                saveLabel = null
+            )
+        }
+        Row(
+            Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 14.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Button(onClick = onRun, modifier = Modifier.weight(1f), enabled = !isRunning) {
+                Text("Запустить")
+            }
+            OutlinedButton(onClick = onStop, modifier = Modifier.weight(1f), enabled = isRunning) {
+                Text("Остановить")
+            }
+        }
+        Text("Логи", style = MaterialTheme.typography.titleMedium)
+        Column(
+            Modifier.fillMaxWidth().weight(1f).padding(top = 8.dp).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            logs.asReversed().forEach { line ->
+                Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Button(onClick = onEdit, modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp)) {
+            Text("Редактировать")
+        }
+    }
+}
+
+@Composable
+private fun ScriptEditorScreen(
+    scriptName: String,
+    source: String,
+    contentPadding: androidx.compose.foundation.layout.PaddingValues,
+    onBack: () -> Unit,
+    onSave: (String) -> Unit,
+    onDelete: () -> Unit
+) {
+    var menuExpanded by remember { mutableStateOf(false) }
+    var draft by remember(scriptName) { mutableStateOf(source) }
+    Column(Modifier.fillMaxSize().padding(contentPadding).padding(horizontal = 18.dp, vertical = 8.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                TextButton(onClick = onBack) { Text("←") }
+                Text(scriptName, style = MaterialTheme.typography.titleMedium)
+            }
+            BoxMenuButton(
+                expanded = menuExpanded,
+                onExpandedChange = { menuExpanded = it },
+                onDelete = {
+                    menuExpanded = false
+                    onDelete()
+                },
+                onSave = {
+                    menuExpanded = false
+                    onSave(draft)
+                },
+                saveLabel = "Сохранить"
+            )
+        }
         OutlinedTextField(
-            value = scripts[selectedScript].orEmpty(),
-            onValueChange = onScriptChange,
-            modifier = Modifier.fillMaxWidth().height(360.dp),
+            value = draft,
+            onValueChange = { draft = it },
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(top = 8.dp, bottom = 8.dp),
             label = { Text("Код сценария") },
             textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace)
         )
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(onClick = onRun, modifier = Modifier.weight(1f)) { Text("Запустить") }
-            OutlinedButton(onClick = onStop, modifier = Modifier.weight(1f)) { Text("Остановить всё") }
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            FilledTonalButton(onClick = onRunOnce, modifier = Modifier.weight(1f)) { Text("Один раз") }
-            if (scripts.size > 1) {
-                OutlinedButton(onClick = onDelete, modifier = Modifier.weight(1f)) { Text("Удалить") }
-            }
-        }
-        Text(
-            "«Запустить» сохраняет сценарий и включает его автоматическое выполнение. " +
-                "Для событийных сценариев оставь сервис работающим.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
     }
 }
 
 @Composable
-private fun BoxDropdown(
-    selectedScript: String,
-    scriptNames: List<String>,
+private fun BoxMenuButton(
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
-    onSelect: (String) -> Unit
+    onDelete: () -> Unit,
+    onSave: (() -> Unit)? = null,
+    saveLabel: String?
 ) {
     Column {
-        OutlinedButton(onClick = { onExpandedChange(true) }, modifier = Modifier.fillMaxWidth()) {
-            Text("Сценарий: $selectedScript")
-        }
+        TextButton(onClick = { onExpandedChange(true) }) { Text("⋮", style = MaterialTheme.typography.headlineSmall) }
         DropdownMenu(expanded = expanded, onDismissRequest = { onExpandedChange(false) }) {
-            scriptNames.forEach { name ->
-                DropdownMenuItem(text = { Text(name) }, onClick = { onSelect(name) })
+            if (saveLabel != null && onSave != null) {
+                DropdownMenuItem(text = { Text(saveLabel) }, onClick = onSave)
             }
-        }
-    }
-}
-
-@Composable
-private fun ColumnScope.DeviceScreen(
-    smsNumber: String,
-    onSmsNumberChange: (String) -> Unit,
-    onFind: () -> Unit,
-    onStopFind: () -> Unit,
-    onShareLocation: () -> Unit
-) {
-    Column(
-        Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        FeatureCard(
-            title = "Найти телефон",
-            description = "Включает звуковой сигнал и мигает фонариком, пока не остановишь поиск."
-        ) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(onClick = onFind, modifier = Modifier.weight(1f)) { Text("Начать поиск") }
-                OutlinedButton(onClick = onStopFind, modifier = Modifier.weight(1f)) { Text("Остановить") }
-            }
-        }
-        FeatureCard(
-            title = "Поделиться местоположением",
-            description = "Откроет SMS с координатами. Перед отправкой сообщение можно проверить."
-        ) {
-            OutlinedTextField(
-                value = smsNumber,
-                onValueChange = onSmsNumberChange,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Номер телефона") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                singleLine = true
-            )
-            Button(onClick = onShareLocation, modifier = Modifier.fillMaxWidth()) {
-                Text("Подготовить SMS с координатами")
-            }
+            DropdownMenuItem(text = { Text("Удалить скрипт") }, onClick = onDelete)
         }
     }
 }
@@ -566,6 +539,7 @@ private fun ColumnScope.SettingsScreen(
     onAutoStartChange: (Boolean) -> Unit,
     onAllowedSenderChange: (String) -> Unit,
     onRequestSmsPermission: () -> Unit,
+    onRequestDevicePermissions: () -> Unit,
     onWriteSettings: () -> Unit,
     onAccessibility: () -> Unit,
     onBatterySettings: () -> Unit
@@ -580,7 +554,7 @@ private fun ColumnScope.SettingsScreen(
         ) {
             SettingSwitch(
                 title = "Автозапуск после перезагрузки",
-                supporting = "Запускаются только сценарии, отмеченные «Авто».",
+                supporting = "Восстанавливаются сценарии, которые не были остановлены вручную.",
                 checked = autoStartEnabled,
                 onCheckedChange = onAutoStartChange
             )
@@ -609,8 +583,11 @@ private fun ColumnScope.SettingsScreen(
         }
         FeatureCard(
             title = "Доступы Android",
-            description = "Некоторым действиям нужны специальные разрешения системы."
+            description = "Выдавайте разрешения только функциям, которыми пользуетесь: запись аудио, телефон, контакты, календарь, геолокация и Bluetooth."
         ) {
+            OutlinedButton(onClick = onRequestDevicePermissions, modifier = Modifier.fillMaxWidth()) {
+                Text("Запросить разрешения функций")
+            }
             OutlinedButton(onClick = onWriteSettings, modifier = Modifier.fillMaxWidth()) {
                 Text("Доступ к системным настройкам")
             }

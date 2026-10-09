@@ -12,6 +12,7 @@ data class ExprStmt(val expression: Expr) : Stmt
 data class IfStmt(val branches: List<Pair<Expr, Block>>, val otherwise: Block?) : Stmt
 data class WhileStmt(val condition: Expr, val body: Block) : Stmt
 data class ForStmt(val name: String, val iterable: Expr, val body: Block) : Stmt
+data class ParallelStmt(val branches: List<Block>) : Stmt
 data object BreakStmt : Stmt
 data object ContinueStmt : Stmt
 data class EventStmt(val event: String, val filters: Map<String, Expr>, val body: Block) : Stmt

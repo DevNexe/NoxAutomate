@@ -102,6 +102,7 @@ class Lexer(private val source: String) {
                         "if" -> TokenType.IF; "elif" -> TokenType.ELIF; "else" -> TokenType.ELSE
                         "while" -> TokenType.WHILE; "for" -> TokenType.FOR; "in" -> TokenType.IN
                         "on" -> TokenType.ON; "break" -> TokenType.BREAK; "continue" -> TokenType.CONTINUE
+                        "parallel" -> TokenType.PARALLEL; "branch" -> TokenType.BRANCH
                         "and" -> TokenType.AND; "or" -> TokenType.OR; "not" -> TokenType.NOT
                         else -> TokenType.IDENTIFIER
                     }

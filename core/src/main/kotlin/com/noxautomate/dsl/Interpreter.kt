@@ -1,5 +1,8 @@
 package com.noxautomate.dsl
 
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+
 sealed interface DslValue {
     data class Number(val value: Double, val integral: Boolean) : DslValue {
         override fun toString(): String = if (integral) value.toLong().toString() else value.toString()
@@ -28,12 +31,24 @@ class Scope(private val parent: Scope? = null) {
         if (name in values) return values.getValue(name)
         return parent?.get(name) ?: throw DslException("Неизвестная переменная '$name'")
     }
+
+    fun snapshot(): Map<String, DslValue> =
+        parent?.snapshot().orEmpty() + values.mapValues { (_, value) -> copyValue(value) }
+
+    private fun copyValue(value: DslValue): DslValue = when (value) {
+        is DslValue.Sequence -> DslValue.Sequence(value.value.map(::copyValue).toMutableList())
+        is DslValue.Mapping -> DslValue.Mapping(value.value.entries.associateTo(mutableMapOf()) {
+            copyValue(it.key) to copyValue(it.value)
+        })
+        else -> value
+    }
 }
 
 class Interpreter(
     private val host: DslHost,
     private val maxLoopIterations: Int = 100_000,
-    private val maxExecutionSteps: Int = 1_000_000
+    private val maxExecutionSteps: Int = 1_000_000,
+    private val parallelDepth: Int = 0
 ) {
     private val globals = Scope()
     private var executionSteps = 0
@@ -43,6 +58,13 @@ class Interpreter(
         executionSteps = 0
         loopDepth = 0
         program.statements.filterNot { it is EventStmt }.forEach { executeStmt(it, globals) }
+    }
+
+    private fun executeBranch(block: Block, inheritedValues: Map<String, DslValue>) {
+        inheritedValues.forEach(globals::define)
+        executionSteps = 0
+        loopDepth = 0
+        executeStmt(block, globals)
     }
 
     fun executeEvent(program: Program, event: String, parameters: Map<String, DslValue> = emptyMap()) {
@@ -135,9 +157,45 @@ class Interpreter(
                     }
                 }
             }
+            is ParallelStmt -> executeParallel(stmt, scope)
             BreakStmt -> if (loopDepth == 0) throw DslException("'break' допустим только внутри цикла") else throw BreakSignal
             ContinueStmt -> if (loopDepth == 0) throw DslException("'continue' допустим только внутри цикла") else throw ContinueSignal
             is EventStmt -> Unit
+        }
+    }
+
+    private fun executeParallel(stmt: ParallelStmt, scope: Scope) {
+        if (stmt.branches.size !in 2..MAX_PARALLEL_BRANCHES) {
+            throw DslException("parallel поддерживает от 2 до $MAX_PARALLEL_BRANCHES веток")
+        }
+        if (parallelDepth >= MAX_PARALLEL_DEPTH) {
+            throw DslException("Превышен лимит вложенности parallel")
+        }
+        val inheritedValues = scope.snapshot()
+        val executor = Executors.newFixedThreadPool(stmt.branches.size)
+        val futures = stmt.branches.map { branch ->
+            executor.submit {
+                Interpreter(host, maxLoopIterations, maxExecutionSteps, parallelDepth + 1)
+                    .executeBranch(branch, inheritedValues)
+            }
+        }
+        try {
+            futures.forEach { future ->
+                try {
+                    future.get()
+                } catch (error: ExecutionException) {
+                    futures.forEach { it.cancel(true) }
+                    val cause = error.cause ?: error
+                    if (cause is RuntimeException) throw cause
+                    throw DslException("Ошибка параллельной ветки: ${cause.message}")
+                }
+            }
+        } catch (error: InterruptedException) {
+            futures.forEach { it.cancel(true) }
+            Thread.currentThread().interrupt()
+            throw DslException("Выполнение parallel прервано")
+        } finally {
+            executor.shutdownNow()
         }
     }
 
@@ -270,4 +328,9 @@ class Interpreter(
 
     private data object BreakSignal : RuntimeException()
     private data object ContinueSignal : RuntimeException()
+
+    private companion object {
+        const val MAX_PARALLEL_BRANCHES = 8
+        const val MAX_PARALLEL_DEPTH = 2
+    }
 }
