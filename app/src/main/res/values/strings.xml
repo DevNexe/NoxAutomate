@@ -1,0 +1,3 @@
+<resources>
+    <string name="accessibility_service_description">Позволяет сценариям Nox Automate находить текст на экране и нажимать соответствующие элементы.</string>
+</resources>
