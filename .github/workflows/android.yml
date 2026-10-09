@@ -26,6 +26,7 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: "latest"
+          packages: "platform-tools"
       - name: Install Android SDK packages
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
       - name: Run DSL tests and build APK
