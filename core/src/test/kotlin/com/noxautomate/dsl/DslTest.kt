@@ -132,4 +132,33 @@ class DslTest {
             }).execute(breakProgram)
         }
     }
+
+    @Test
+    fun dispatchesDeviceNetworkTimerAndAppEvents() {
+        val program = Parser(Lexer("""
+            on power.connected():
+                system.record(value="charging")
+            on screen.off():
+                system.record(value="screen")
+            on network.connected(transport="wifi"):
+                system.record(value="network")
+            on time.every(minutes=5):
+                system.record(value="timer")
+            on app.foreground(package_name="com.example"):
+                system.record(value="app")
+        """.trimIndent()).tokenize()).parse()
+        val events = mutableListOf<String>()
+        val interpreter = Interpreter(object : DslHost {
+            override fun invoke(function: String, positional: List<DslValue>, named: Map<String, DslValue>): DslValue {
+                events += (named.getValue("value") as DslValue.Text).value
+                return DslValue.Null
+            }
+        })
+        interpreter.executeEvent(program, "power.connected")
+        interpreter.executeEvent(program, "screen.off")
+        interpreter.executeEvent(program, "network.connected", mapOf("transport" to DslValue.Text("wifi")))
+        interpreter.executeEvent(program, "time.every", mapOf("minutes" to DslValue.Number(5.0, true)))
+        interpreter.executeEvent(program, "app.foreground", mapOf("package_name" to DslValue.Text("com.example")))
+        assertEquals(listOf("charging", "screen", "network", "timer", "app"), events)
+    }
 }

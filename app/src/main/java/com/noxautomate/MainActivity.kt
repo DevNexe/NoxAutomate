@@ -66,13 +66,14 @@ class MainActivity : ComponentActivity() {
             var selectedScript by remember {
                 mutableStateOf(preferences.getString("selected_script", null)?.takeIf { it in scripts } ?: scripts.keys.first())
             }
+            val enabledScripts = remember {
+                mutableStateListOf<String>().also { it.addAll(AutomationStore.enabledScripts(this@MainActivity)) }
+            }
             var nextScriptId by remember { mutableIntStateOf(scripts.size + 1) }
             var runStatus by remember { mutableStateOf(RunStatus.read(this@MainActivity)) }
             val script = scripts[selectedScript].orEmpty()
             LaunchedEffect(scripts.toMap()) {
-                val saved = JSONObject()
-                scripts.forEach { (name, source) -> saved.put(name, source) }
-                preferences.edit().putString("scripts", saved.toString()).apply()
+                AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
             }
             LaunchedEffect(selectedScript) {
                 preferences.edit().putString("selected_script", selectedScript).apply()
@@ -98,7 +99,26 @@ class MainActivity : ComponentActivity() {
                         Text("Nox Automate", style = MaterialTheme.typography.headlineMedium)
                         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             scripts.keys.toList().forEach { name ->
-                                Button(onClick = { selectedScript = name }) { Text(name) }
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Button(onClick = { selectedScript = name }) { Text(name) }
+                                    Button(onClick = {
+                                        if (name in enabledScripts) enabledScripts.remove(name)
+                                        else enabledScripts.add(name)
+                                        AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
+                                        AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
+                                        if (enabledScripts.isEmpty()) {
+                                            stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
+                                            RunStatus.write(this@MainActivity, "Все сценарии автоматизации остановлены")
+                                        } else {
+                                            try {
+                                                startForegroundService(Intent(this@MainActivity, AutomationForegroundService::class.java))
+                                                RunStatus.write(this@MainActivity, "Активные сценарии обновлены")
+                                            } catch (error: Exception) {
+                                                RunStatus.write(this@MainActivity, "Ошибка запуска сервиса: ${error.message}")
+                                            }
+                                        }
+                                    }) { Text(if (name in enabledScripts) "Авто: вкл." else "Авто: выкл.") }
+                                }
                             }
                             Button(onClick = {
                                 while ("Сценарий $nextScriptId" in scripts) nextScriptId++
@@ -109,14 +129,23 @@ class MainActivity : ComponentActivity() {
                             if (scripts.size > 1) {
                                 Button(onClick = {
                                     scripts.remove(selectedScript)
+                                    enabledScripts.remove(selectedScript)
+                                    AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
+                                    AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
                                     selectedScript = scripts.keys.first()
+                                    if (enabledScripts.isEmpty()) stopService(
+                                        Intent(this@MainActivity, AutomationForegroundService::class.java)
+                                    ) else refreshAutomationService()
                                 }) { Text("Удалить") }
                             }
                         }
                         Text("Скрипт автоматизации", style = MaterialTheme.typography.titleMedium)
                         OutlinedTextField(
                             value = script,
-                            onValueChange = { scripts[selectedScript] = it },
+                            onValueChange = {
+                                scripts[selectedScript] = it
+                                AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
+                            },
                             modifier = Modifier.fillMaxWidth().heightIn(min = 260.dp),
                             minLines = 10,
                             label = { Text(selectedScript) }
@@ -127,13 +156,17 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Button(onClick = {
                                 try {
-                                    startForegroundService(Intent(this@MainActivity, AutomationForegroundService::class.java)
-                                        .putExtra(AutomationForegroundService.EXTRA_SCRIPT, script))
-                                } catch (error: SecurityException) {
+                                    AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
+                                    if (selectedScript !in enabledScripts) enabledScripts.add(selectedScript)
+                                    AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
+                                    startForegroundService(Intent(this@MainActivity, AutomationForegroundService::class.java))
+                                } catch (error: Exception) {
                                     RunStatus.write(this@MainActivity, "Ошибка запуска сервиса: ${error.message}")
                                 }
                             }) { Text("Запустить") }
                             Button(onClick = {
+                                enabledScripts.clear()
+                                AutomationStore.setEnabledScripts(this@MainActivity, emptySet())
                                 stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
                                 RunStatus.write(this@MainActivity, "Сервис остановлен")
                             }) {
@@ -159,6 +192,14 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    private fun refreshAutomationService() {
+        try {
+            startForegroundService(Intent(this, AutomationForegroundService::class.java))
+        } catch (error: Exception) {
+            RunStatus.write(this, "Ошибка запуска сервиса: ${error.message}")
         }
     }
 }

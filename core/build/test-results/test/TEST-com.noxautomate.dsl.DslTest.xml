@@ -1,15 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.noxautomate.dsl.DslTest" tests="9" skipped="0" failures="0" errors="0" timestamp="2026-10-09T10:26:15.601Z" hostname="DESKTOP-DC1VHB0" time="0.864">
+<testsuite name="com.noxautomate.dsl.DslTest" tests="10" skipped="0" failures="0" errors="0" timestamp="2026-10-09T11:10:31.879Z" hostname="DESKTOP-DC1VHB0" time="1.863">
   <properties/>
-  <testcase name="parsesNamedEventHandler()" classname="com.noxautomate.dsl.DslTest" time="0.341"/>
-  <testcase name="lexerEmitsNestedIndentAndDedentTokens()" classname="com.noxautomate.dsl.DslTest" time="0.011"/>
-  <testcase name="rejectsInconsistentIndentation()" classname="com.noxautomate.dsl.DslTest" time="0.187"/>
-  <testcase name="batteryEventUsesThresholdAndDirection()" classname="com.noxautomate.dsl.DslTest" time="0.146"/>
-  <testcase name="nestedLoopsRespectGlobalExecutionBudget()" classname="com.noxautomate.dsl.DslTest" time="0.019"/>
-  <testcase name="interpreterRunsBranchesAndLoops()" classname="com.noxautomate.dsl.DslTest" time="0.023"/>
-  <testcase name="comparisonAfterIndexExpressionIsNotParsedAsAssignment()" classname="com.noxautomate.dsl.DslTest" time="0.005"/>
-  <testcase name="nullVariablesRemainDefinedAndBreakOutsideLoopIsAnError()" classname="com.noxautomate.dsl.DslTest" time="0.011"/>
-  <testcase name="supportsListAndDictionaryIndexingAndBlockScope()" classname="com.noxautomate.dsl.DslTest" time="0.013"/>
+  <testcase name="parsesNamedEventHandler()" classname="com.noxautomate.dsl.DslTest" time="0.705"/>
+  <testcase name="lexerEmitsNestedIndentAndDedentTokens()" classname="com.noxautomate.dsl.DslTest" time="0.019"/>
+  <testcase name="rejectsInconsistentIndentation()" classname="com.noxautomate.dsl.DslTest" time="0.267"/>
+  <testcase name="batteryEventUsesThresholdAndDirection()" classname="com.noxautomate.dsl.DslTest" time="0.202"/>
+  <testcase name="nestedLoopsRespectGlobalExecutionBudget()" classname="com.noxautomate.dsl.DslTest" time="0.066"/>
+  <testcase name="dispatchesDeviceNetworkTimerAndAppEvents()" classname="com.noxautomate.dsl.DslTest" time="0.021"/>
+  <testcase name="interpreterRunsBranchesAndLoops()" classname="com.noxautomate.dsl.DslTest" time="0.033"/>
+  <testcase name="comparisonAfterIndexExpressionIsNotParsedAsAssignment()" classname="com.noxautomate.dsl.DslTest" time="0.012"/>
+  <testcase name="nullVariablesRemainDefinedAndBreakOutsideLoopIsAnError()" classname="com.noxautomate.dsl.DslTest" time="0.003"/>
+  <testcase name="supportsListAndDictionaryIndexingAndBlockScope()" classname="com.noxautomate.dsl.DslTest" time="0.026"/>
   <system-out><![CDATA[]]></system-out>
   <system-err><![CDATA[]]></system-err>
 </testsuite>

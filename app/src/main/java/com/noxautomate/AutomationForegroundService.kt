@@ -30,11 +30,13 @@ import androidx.work.workDataOf
 
 class AutomationForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val interpreterMutex = Mutex()
-    private var program: Program? = null
-    private var interpreter: Interpreter? = null
-    private var batteryReceiver: android.content.BroadcastReceiver? = null
-    private var wifiReceiver: android.content.BroadcastReceiver? = null
+    private val reloadMutex = Mutex()
+    private val flows = mutableMapOf<String, RunningFlow>()
+    private val receivers = mutableListOf<android.content.BroadcastReceiver>()
+    private val scheduleJobs = mutableListOf<Job>()
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    private data class RunningFlow(val name: String, val program: Program, val interpreter: Interpreter, val mutex: Mutex = Mutex())
 
     override fun onCreate() {
         super.onCreate()
@@ -43,99 +45,229 @@ class AutomationForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val preferences = getSharedPreferences("nox_automate", Context.MODE_PRIVATE)
-        val script = intent?.getStringExtra(EXTRA_SCRIPT) ?: preferences.getString(EXTRA_ACTIVE_SCRIPT, null)
-        if (script == null) {
-            stopSelf(startId)
-            return START_NOT_STICKY
-        }
-        preferences.edit().putString(EXTRA_ACTIVE_SCRIPT, script).apply()
-        clearTriggers()
         serviceScope.launch {
-            try {
-                val parsed = withContext(Dispatchers.Default) { Parser(Lexer(script).tokenize()).parse() }
-                val unsupportedEvents = parsed.statements.filterIsInstance<EventStmt>()
-                    .map { it.event }.filterNot { it == "battery.changed" || it == "wifi.connected" }.distinct()
-                if (unsupportedEvents.isNotEmpty()) {
-                    throw DslException("Неизвестные события: ${unsupportedEvents.joinToString()}")
+            reloadMutex.withLock {
+                clearTriggers()
+                synchronized(flows) { flows.clear() }
+                val scripts = AutomationStore.scripts(this@AutomationForegroundService)
+                val enabled = AutomationStore.enabledScripts(this@AutomationForegroundService)
+                if (enabled.isEmpty()) {
+                    stopSelf(startId)
+                    return@withLock
                 }
-                validateTriggerPermissions(parsed)
-                program = parsed
-                interpreter = Interpreter(AndroidDslHost(this@AutomationForegroundService))
-                interpreter?.execute(parsed)
-                registerTriggers(parsed)
-                updateNotification("Скрипт запущен")
-            } catch (error: DslException) {
-                updateNotification("Ошибка: ${error.message}")
-                stopSelf(startId)
-            } catch (error: Exception) {
-                updateNotification("Ошибка выполнения: ${error.message}")
-                stopSelf(startId)
+                val errors = mutableListOf<String>()
+                for (name in enabled) {
+                    val source = scripts[name]
+                    if (source == null) {
+                        errors += "$name: сценарий удалён"
+                        continue
+                    }
+                    try {
+                        val parsed = withContext(Dispatchers.Default) { Parser(Lexer(source).tokenize()).parse() }
+                        validateEvents(parsed)
+                        val runtime = RunningFlow(name, parsed, Interpreter(AndroidDslHost(this@AutomationForegroundService)))
+                        runtime.interpreter.execute(parsed)
+                        synchronized(flows) { flows[name] = runtime }
+                    } catch (error: Exception) {
+                        errors += "$name: ${error.message}"
+                    }
+                }
+                if (flowSnapshot().isEmpty()) {
+                    updateNotification(errors.joinToString("; ").ifEmpty { "Нет активных сценариев" })
+                    stopSelf(startId)
+                    return@withLock
+                }
+                try {
+                    registerTriggers()
+                    updateNotification("Активны сценарии: ${flowSnapshot().joinToString { it.name }}")
+                    if (errors.isNotEmpty()) updateNotification("Ошибка сценария: ${errors.joinToString("; ")}")
+                } catch (error: Exception) {
+                    clearTriggers()
+                    synchronized(flows) { flows.clear() }
+                    updateNotification("Не удалось запустить триггеры: ${error.message}")
+                    stopSelf(startId)
+                }
             }
         }
         return START_STICKY
     }
 
     private fun clearTriggers() {
-        batteryReceiver?.let { unregisterReceiver(it) }
-        wifiReceiver?.let { unregisterReceiver(it) }
-        batteryReceiver = null
-        wifiReceiver = null
+        scheduleJobs.forEach(Job::cancel)
+        scheduleJobs.clear()
+        receivers.forEach { receiver -> runCatching { unregisterReceiver(receiver) } }
+        receivers.clear()
+        networkCallback?.let { callback ->
+            val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            runCatching { manager.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
     }
 
-    private fun registerTriggers(parsed: Program) {
-        val handlers = parsed.statements.filterIsInstance<EventStmt>()
-        if (handlers.any { it.event == "battery.changed" }) {
-            val receiver = object : android.content.BroadcastReceiver() {
-                override fun onReceive(context: Context, intent: Intent) {
-                    if (intent.action != Intent.ACTION_BATTERY_CHANGED) return
-                    val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-                    val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
-                    val percent = if (level >= 0 && scale > 0) level * 100 / scale else return
-                    serviceScope.launch {
-                        try {
-                            interpreterMutex.withLock {
-                                interpreter?.executeEvent(parsed, "battery.changed", mapOf(
-                                    "level" to DslValue.Number(percent.toDouble(), true)
-                                ))
-                            }
-                        } catch (error: Exception) { updateNotification("Ошибка события: ${error.message}") }
-                    }
-                }
-            }
-            registerSystemReceiver(receiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            batteryReceiver = receiver
-        }
-        if (handlers.any { it.event == "wifi.connected" }) {
-            val receiver = object : android.content.BroadcastReceiver() {
-                override fun onReceive(context: Context, intent: Intent) {
-                    if (intent.action != WifiManager.NETWORK_STATE_CHANGED_ACTION) return
-                    val info = intent.getParcelableExtra<android.net.NetworkInfo>(WifiManager.EXTRA_NETWORK_INFO)
-                    if (info?.isConnected != true) return
-                    val ssid = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
-                        .connectionInfo?.ssid?.removeSurrounding("\"") ?: return
-                    serviceScope.launch {
-                        try {
-                            interpreterMutex.withLock {
-                                interpreter?.executeEvent(parsed, "wifi.connected", mapOf("ssid" to DslValue.Text(ssid)))
-                            }
-                        } catch (error: Exception) { updateNotification("Ошибка события: ${error.message}") }
-                    }
-                }
-            }
-            registerSystemReceiver(receiver, IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION))
-            wifiReceiver = receiver
-        }
-    }
-
-    private fun validateTriggerPermissions(parsed: Program) {
-        val handlers = parsed.statements.filterIsInstance<EventStmt>()
+    private fun validateEvents(program: Program) {
+        val handlers = program.statements.filterIsInstance<EventStmt>()
+        val supported = setOf(
+            "battery.changed", "power.connected", "power.disconnected",
+            "screen.on", "screen.off", "wifi.connected", "network.connected",
+            "network.disconnected", "time.every", "app.foreground"
+        )
+        val unknown = handlers.map { it.event }.filterNot(supported::contains).distinct()
+        if (unknown.isNotEmpty()) throw DslException("Неизвестные события: ${unknown.joinToString()}")
         if (handlers.any { it.event == "wifi.connected" } &&
             ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
         ) {
             throw DslException("Для обработчика wifi.connected требуется разрешение ACCESS_FINE_LOCATION")
         }
+        if (handlers.any { it.event == "wifi.connected" }) {
+            val location = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+            val enabled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                location.isLocationEnabled
+            } else {
+                @Suppress("DEPRECATION")
+                location.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) ||
+                    location.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)
+            }
+            if (!enabled) throw DslException("Для wifi.connected включите службы геолокации")
+        }
+        if (handlers.filter { it.event == "time.every" }.any { event ->
+                val literal = event.filters["minutes"] as? LiteralExpr
+                val value = (literal?.value as? Number)?.toDouble() ?: return@any true
+                value % 1.0 != 0.0 || value !in 1.0..1440.0
+            }
+        ) {
+            throw DslException("Каждый time.every требует целое число minutes от 1 до 1440")
+        }
     }
+
+    private fun registerTriggers() {
+        val events = flowSnapshot().flatMap { runtime ->
+            runtime.program.statements.filterIsInstance<EventStmt>()
+        }.map { it.event }.toSet()
+
+        if (events.any { it in setOf("battery.changed", "power.connected", "power.disconnected", "screen.on", "screen.off", "wifi.connected") }) {
+            val filter = IntentFilter().apply {
+                if ("battery.changed" in events) addAction(Intent.ACTION_BATTERY_CHANGED)
+                if ("power.connected" in events) addAction(Intent.ACTION_POWER_CONNECTED)
+                if ("power.disconnected" in events) addAction(Intent.ACTION_POWER_DISCONNECTED)
+                if ("screen.on" in events) addAction(Intent.ACTION_SCREEN_ON)
+                if ("screen.off" in events) addAction(Intent.ACTION_SCREEN_OFF)
+                if ("wifi.connected" in events) addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION)
+            }
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    when (intent.action) {
+                        Intent.ACTION_BATTERY_CHANGED -> {
+                            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                            if (level >= 0 && scale > 0) emitEvent("battery.changed", mapOf(
+                                "level" to DslValue.Number((level * 100 / scale).toDouble(), true)
+                            ))
+                        }
+                        Intent.ACTION_POWER_CONNECTED -> emitEvent("power.connected")
+                        Intent.ACTION_POWER_DISCONNECTED -> emitEvent("power.disconnected")
+                        Intent.ACTION_SCREEN_ON -> emitEvent("screen.on")
+                        Intent.ACTION_SCREEN_OFF -> emitEvent("screen.off")
+                        WifiManager.NETWORK_STATE_CHANGED_ACTION -> {
+                            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                intent.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO, android.net.NetworkInfo::class.java)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                intent.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO)
+                            }
+                            if (info?.isConnected == true) {
+                                val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                                val ssid = wifi.connectionInfo?.ssid?.removeSurrounding("\"")
+                                emitEvent("wifi.connected", ssid?.takeUnless { it == "<unknown ssid>" }
+                                    ?.let { mapOf("ssid" to DslValue.Text(it)) } ?: emptyMap())
+                            }
+                        }
+                    }
+                }
+            }
+            registerSystemReceiver(receiver, filter)
+            receivers += receiver
+        }
+
+        if ("app.foreground" in events) {
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    if (intent.action != AutomationAccessibilityService.ACTION_APP_FOREGROUND) return
+                    val packageName = intent.getStringExtra(AutomationAccessibilityService.EXTRA_PACKAGE_NAME) ?: return
+                    emitEvent("app.foreground", mapOf("package_name" to DslValue.Text(packageName)))
+                }
+            }
+            ContextCompat.registerReceiver(
+                this, receiver, IntentFilter(AutomationAccessibilityService.ACTION_APP_FOREGROUND),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            receivers += receiver
+        }
+
+        if (events.any { it == "network.connected" || it == "network.disconnected" }) {
+            val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                private var lastTransport: String? = null
+
+                override fun onCapabilitiesChanged(network: android.net.Network, capabilities: android.net.NetworkCapabilities) {
+                    val transport = when {
+                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                        else -> "other"
+                    }
+                    if (transport == lastTransport) return
+                    lastTransport = transport
+                    emitEvent("network.connected", mapOf("transport" to DslValue.Text(transport)))
+                }
+
+                override fun onLost(network: android.net.Network) {
+                    lastTransport = null
+                    emitEvent("network.disconnected")
+                }
+            }
+            manager.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+        }
+
+        val timedHandlers = flowSnapshot().flatMap { runtime ->
+            runtime.program.statements.filterIsInstance<EventStmt>()
+                .filter { it.event == "time.every" }
+        }
+        val parsedIntervals = timedHandlers.mapNotNull { event ->
+            val literal = event.filters["minutes"] as? LiteralExpr
+            val numericValue = (literal?.value as? Number)?.toDouble() ?: return@mapNotNull null
+            val minutes = numericValue.toInt()
+            minutes.takeIf { numericValue == it.toDouble() && it in 1..1440 }
+        }
+        if (parsedIntervals.size != timedHandlers.size) {
+            throw DslException("Каждый time.every требует целое число minutes от 1 до 1440")
+        }
+        val intervals = parsedIntervals.filterNotNull().toSet()
+        intervals.forEach { minutes ->
+            scheduleJobs += serviceScope.launch {
+                while (isActive) {
+                    delay(minutes * 60_000L)
+                    emitEvent("time.every", mapOf("minutes" to DslValue.Number(minutes.toDouble(), true)))
+                }
+            }
+        }
+    }
+
+    private fun emitEvent(event: String, parameters: Map<String, DslValue> = emptyMap()) {
+        serviceScope.launch {
+            flowSnapshot().forEach { runtime ->
+                try {
+                    runtime.mutex.withLock {
+                        runtime.interpreter.executeEvent(runtime.program, event, parameters)
+                    }
+                } catch (error: Exception) {
+                    updateNotification("Ошибка $event: ${error.message}")
+                }
+            }
+        }
+    }
+
+    private fun flowSnapshot(): List<RunningFlow> = synchronized(flows) { flows.values.toList() }
 
     private fun registerSystemReceiver(receiver: android.content.BroadcastReceiver, filter: IntentFilter) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -148,7 +280,6 @@ class AutomationForegroundService : Service() {
 
     override fun onDestroy() {
         clearTriggers()
-        getSharedPreferences("nox_automate", Context.MODE_PRIVATE).edit().remove(EXTRA_ACTIVE_SCRIPT).apply()
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -174,7 +305,6 @@ class AutomationForegroundService : Service() {
 
     companion object {
         const val EXTRA_SCRIPT = "script"
-        private const val EXTRA_ACTIVE_SCRIPT = "active_script"
         private const val CHANNEL_ID = "automation"
         private const val NOTIFICATION_ID = 1001
     }
@@ -266,7 +396,8 @@ private class AndroidDslHost(private val context: Context) : DslHost {
                 DslValue.Null
             }
             "app.launch" -> {
-                val launch = context.packageManager.getLaunchIntentForPackage(text(arg(0, "package_name")))
+                val packageName = text(arg(0, "package_name"))
+                val launch = context.packageManager.getLaunchIntentForPackage(packageName)
                 if (launch != null) context.startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 DslValue.Bool(launch != null)
             }
@@ -286,6 +417,40 @@ private class AndroidDslHost(private val context: Context) : DslHost {
                 val service = AutomationAccessibilityService.current()
                     ?: throw DslException("Сначала включите службу Nox Automate в настройках специальных возможностей")
                 DslValue.Text(service.activePackageName.orEmpty())
+            }
+            "accessibility.find_text" -> {
+                val service = AutomationAccessibilityService.current()
+                    ?: throw DslException("Сначала включите службу Nox Automate в настройках специальных возможностей")
+                DslValue.Bool(service.findText(text(arg(0, "text"))))
+            }
+            "accessibility.set_text" -> {
+                val service = AutomationAccessibilityService.current()
+                    ?: throw DslException("Сначала включите службу Nox Automate в настройках специальных возможностей")
+                DslValue.Bool(service.setText(text(arg(0, "target")), text(arg(1, "text"))))
+            }
+            "accessibility.scroll" -> {
+                val service = AutomationAccessibilityService.current()
+                    ?: throw DslException("Сначала включите службу Nox Automate в настройках специальных возможностей")
+                DslValue.Bool(service.scroll(text(arg(0, "direction"))))
+            }
+            "accessibility.tap" -> {
+                val service = AutomationAccessibilityService.current()
+                    ?: throw DslException("Сначала включите службу Nox Automate в настройках специальных возможностей")
+                DslValue.Bool(service.tap(int(arg(0, "x")), int(arg(1, "y"))))
+            }
+            "accessibility.swipe" -> {
+                val service = AutomationAccessibilityService.current()
+                    ?: throw DslException("Сначала включите службу Nox Automate в настройках специальных возможностей")
+                val duration = named["duration_ms"]?.let(::int) ?: positional.getOrNull(4)?.let(::int) ?: 400
+                DslValue.Bool(service.swipe(
+                    int(arg(0, "x1")), int(arg(1, "y1")),
+                    int(arg(2, "x2")), int(arg(3, "y2")), duration.toLong()
+                ))
+            }
+            "accessibility.press_back" -> {
+                val service = AutomationAccessibilityService.current()
+                    ?: throw DslException("Сначала включите службу Nox Automate в настройках специальных возможностей")
+                DslValue.Bool(service.pressBack())
             }
             else -> throw DslException("Неизвестная встроенная функция '$function'")
         }
