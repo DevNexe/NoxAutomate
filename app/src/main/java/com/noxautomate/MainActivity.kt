@@ -12,22 +12,37 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.work.OneTimeWorkRequestBuilder
@@ -39,6 +54,9 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.statusBarColor = android.graphics.Color.rgb(11, 16, 21)
+        window.navigationBarColor = android.graphics.Color.rgb(11, 16, 21)
+        window.decorView.systemUiVisibility = 0
         val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
             if (results[android.Manifest.permission.RECEIVE_SMS] == true &&
                 AutomationStore.enabledScripts(this).isNotEmpty()
@@ -102,249 +120,211 @@ class MainActivity : ComponentActivity() {
                 )
                 onDispose { unregisterReceiver(receiver) }
             }
-            MaterialTheme {
-                Surface(Modifier.fillMaxSize()) {
+            var selectedTab by remember { mutableStateOf(MainTab.SCRIPTS) }
+            NoxTheme {
+                Scaffold(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    bottomBar = {
+                        NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                            MainTab.entries.forEach { tab ->
+                                NavigationBarItem(
+                                    selected = selectedTab == tab,
+                                    onClick = { selectedTab = tab },
+                                    icon = { Text(tab.shortLabel) },
+                                    label = { Text(tab.label) }
+                                )
+                            }
+                        }
+                    }
+                ) { contentPadding ->
                     Column(
-                        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                        Modifier.fillMaxSize().padding(contentPadding).padding(horizontal = 18.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        Text("Nox Automate", style = MaterialTheme.typography.headlineMedium)
-                        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            scripts.keys.toList().forEach { name ->
-                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Button(onClick = { selectedScript = name }) { Text(name) }
-                                    Button(onClick = {
-                                        if (name in enabledScripts) enabledScripts.remove(name)
-                                        else enabledScripts.add(name)
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text("NOX AUTOMATE", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                            Text(tabTitle(selectedTab), style = MaterialTheme.typography.headlineSmall)
+                        }
+                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                            Text(
+                                text = runStatus,
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                        when (selectedTab) {
+                            MainTab.SCRIPTS -> ScriptsScreen(
+                                scripts = scripts,
+                                enabledScripts = enabledScripts,
+                                selectedScript = selectedScript,
+                                onSelect = {
+                                    selectedScript = it
+                                    selectedTab = MainTab.EDITOR
+                                },
+                                onToggle = { name -> toggleScript(name, enabledScripts, scripts) },
+                                onAdd = {
+                                    while ("Сценарий $nextScriptId" in scripts) nextScriptId++
+                                    val name = "Сценарий ${nextScriptId++}"
+                                    scripts[name] = ""
+                                    selectedScript = name
+                                    selectedTab = MainTab.EDITOR
+                                },
+                                onDelete = { name ->
+                                    if (scripts.size > 1) {
+                                        scripts.remove(name)
+                                        enabledScripts.remove(name)
                                         AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
                                         AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
+                                        if (selectedScript == name) selectedScript = scripts.keys.first()
                                         if (enabledScripts.isEmpty()) {
                                             stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
-                                            RunStatus.write(this@MainActivity, "Все сценарии автоматизации остановлены")
                                         } else {
-                                            try {
-                                                startForegroundService(Intent(this@MainActivity, AutomationForegroundService::class.java))
-                                                RunStatus.write(this@MainActivity, "Активные сценарии обновлены")
-                                            } catch (error: Exception) {
-                                                RunStatus.write(this@MainActivity, "Ошибка запуска сервиса: ${error.message}")
-                                            }
+                                            refreshAutomationService()
                                         }
-                                    }) { Text(if (name in enabledScripts) "Авто: вкл." else "Авто: выкл.") }
+                                    }
                                 }
-                            }
-                            Button(onClick = {
-                                while ("Сценарий $nextScriptId" in scripts) nextScriptId++
-                                val name = "Сценарий ${nextScriptId++}"
-                                scripts[name] = ""
-                                selectedScript = name
-                            }) { Text("+") }
-                            if (scripts.size > 1) {
-                                Button(onClick = {
-                                    scripts.remove(selectedScript)
-                                    enabledScripts.remove(selectedScript)
-                                    AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
+                            )
+                            MainTab.EDITOR -> EditorScreen(
+                                scripts = scripts,
+                                selectedScript = selectedScript,
+                                onSelect = { selectedScript = it },
+                                onScriptChange = {
+                                    scripts[selectedScript] = it
                                     AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
-                                    selectedScript = scripts.keys.first()
-                                    if (enabledScripts.isEmpty()) stopService(
-                                        Intent(this@MainActivity, AutomationForegroundService::class.java)
-                                    ) else refreshAutomationService()
-                                }) { Text("Удалить") }
-                            }
-                        }
-                        Text("Скрипт автоматизации", style = MaterialTheme.typography.titleMedium)
-                        OutlinedTextField(
-                            value = script,
-                            onValueChange = {
-                                scripts[selectedScript] = it
-                                AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
-                            },
-                            modifier = Modifier.fillMaxWidth().heightIn(min = 260.dp),
-                            minLines = 10,
-                            label = { Text(selectedScript) }
-                        )
-                        Row(
-                            Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(onClick = {
-                                try {
-                                    AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
-                                    if (selectedScript !in enabledScripts) enabledScripts.add(selectedScript)
-                                    AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
-                                    startForegroundService(Intent(this@MainActivity, AutomationForegroundService::class.java))
-                                } catch (error: Exception) {
-                                    RunStatus.write(this@MainActivity, "Ошибка запуска сервиса: ${error.message}")
+                                },
+                                onRun = {
+                                    try {
+                                        AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
+                                        if (selectedScript !in enabledScripts) enabledScripts.add(selectedScript)
+                                        AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
+                                        startForegroundService(Intent(this@MainActivity, AutomationForegroundService::class.java))
+                                    } catch (error: Exception) {
+                                        RunStatus.write(this@MainActivity, "Ошибка запуска сервиса: ${error.message}")
+                                    }
+                                },
+                                onStop = {
+                                    enabledScripts.clear()
+                                    AutomationStore.setEnabledScripts(this@MainActivity, emptySet())
+                                    stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
+                                    RunStatus.write(this@MainActivity, "Сервис остановлен")
+                                },
+                                onRunOnce = {
+                                    val request = OneTimeWorkRequestBuilder<ScriptWorker>()
+                                        .setInputData(workDataOf(AutomationForegroundService.EXTRA_SCRIPT to script))
+                                        .build()
+                                    WorkManager.getInstance(this@MainActivity).enqueue(request)
+                                    RunStatus.write(this@MainActivity, "Разовый запуск поставлен в очередь")
+                                },
+                                onDelete = {
+                                    if (scripts.size > 1) {
+                                        scripts.remove(selectedScript)
+                                        enabledScripts.remove(selectedScript)
+                                        AutomationStore.setEnabledScripts(this@MainActivity, enabledScripts.toSet())
+                                        AutomationStore.saveScripts(this@MainActivity, scripts.toMap())
+                                        selectedScript = scripts.keys.first()
+                                        if (enabledScripts.isEmpty()) {
+                                            stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
+                                        } else {
+                                            refreshAutomationService()
+                                        }
+                                    }
                                 }
-                            }) { Text("Запустить") }
-                            Button(onClick = {
-                                enabledScripts.clear()
-                                AutomationStore.setEnabledScripts(this@MainActivity, emptySet())
-                                stopService(Intent(this@MainActivity, AutomationForegroundService::class.java))
-                                RunStatus.write(this@MainActivity, "Сервис остановлен")
-                            }) {
-                                Text("Остановить")
-                            }
-                            Button(onClick = {
-                                val request = OneTimeWorkRequestBuilder<ScriptWorker>()
-                                    .setInputData(workDataOf(AutomationForegroundService.EXTRA_SCRIPT to script))
-                                    .build()
-                                WorkManager.getInstance(this@MainActivity).enqueue(request)
-                                RunStatus.write(this@MainActivity, "Разовый запуск поставлен в очередь")
-                            }) { Text("Выполнить один раз") }
-                            Button(onClick = {
-                                val settings = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
-                                    .setData(Uri.parse("package:$packageName"))
-                                startActivity(settings)
-                            }) { Text("Доступ к настройкам") }
-                            Button(onClick = {
-                                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                            }) { Text("Спец. возможности") }
-                        }
-                        Text("Поиск моего телефона", style = MaterialTheme.typography.titleMedium)
-                        OutlinedTextField(
-                            value = smsNumber,
-                            onValueChange = { smsNumber = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            label = { Text("Номер для SMS с моими координатами") },
-                            singleLine = true
-                        )
-                        Row(
-                            Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(onClick = {
-                                val missing = listOf(
-                                    android.Manifest.permission.CAMERA,
-                                    android.Manifest.permission.POST_NOTIFICATIONS
-                                ).filter {
-                                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                        ContextCompat.checkSelfPermission(this@MainActivity, it) != PackageManager.PERMISSION_GRANTED
-                                    || it == android.Manifest.permission.CAMERA &&
-                                        ContextCompat.checkSelfPermission(this@MainActivity, it) != PackageManager.PERMISSION_GRANTED
-                                }
-                                if (missing.isNotEmpty()) {
-                                    permissionLauncher.launch(missing.toTypedArray())
-                                    RunStatus.write(this@MainActivity, "Разрешите камеру и уведомления, затем нажмите «Найти» снова")
-                                } else {
-                                    val policy = getSystemService(android.app.NotificationManager::class.java)
-                                    if (!policy.isNotificationPolicyAccessGranted) {
-                                        RunStatus.write(this@MainActivity, "Нужно разрешение для временного выхода из режима «Не беспокоить»")
-                                        startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+                            )
+                            MainTab.DEVICE -> DeviceScreen(
+                                smsNumber = smsNumber,
+                                onSmsNumberChange = { smsNumber = it },
+                                onFind = {
+                                    val missing = buildList {
+                                        if (ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                                            add(android.Manifest.permission.CAMERA)
+                                        }
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                            ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                                        ) {
+                                            add(android.Manifest.permission.POST_NOTIFICATIONS)
+                                        }
+                                    }
+                                    if (missing.isNotEmpty()) {
+                                        permissionLauncher.launch(missing.toTypedArray())
+                                        RunStatus.write(this@MainActivity, "Разреши запрошенные права и нажми «Найти телефон» ещё раз")
                                     } else {
                                         startForegroundService(
                                             Intent(this@MainActivity, AutomationForegroundService::class.java)
                                                 .setAction(AutomationForegroundService.ACTION_FIND_START)
                                         )
                                     }
-                                }
-                            }) { Text("Найти") }
-                            Button(onClick = {
-                                startService(
-                                    Intent(this@MainActivity, AutomationForegroundService::class.java)
-                                        .setAction(AutomationForegroundService.ACTION_FIND_STOP)
-                                )
-                            }) { Text("Остановить поиск") }
-                        }
-                        Button(
-                            onClick = {
-                                if (smsNumber.isBlank()) {
-                                    RunStatus.write(this@MainActivity, "Введите номер телефона для SMS")
-                                } else {
-                                    activityScope.launch {
-                                        try {
-                                            val location = LocationSharing.currentLocation(this@MainActivity)
-                                            if (location == null) {
-                                                RunStatus.write(this@MainActivity, "Не удалось определить геопозицию")
-                                            } else {
-                                                val message = "Мои координаты: https://maps.google.com/?q=${location.latitude},${location.longitude}"
-                                                val sms = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(smsNumber)}"))
-                                                    .putExtra("sms_body", message)
-                                                if (sms.resolveActivity(packageManager) == null) {
-                                                    RunStatus.write(this@MainActivity, "На устройстве нет приложения для SMS")
+                                },
+                                onStopFind = {
+                                    startForegroundService(
+                                        Intent(this@MainActivity, AutomationForegroundService::class.java)
+                                            .setAction(AutomationForegroundService.ACTION_FIND_STOP)
+                                    )
+                                },
+                                onShareLocation = {
+                                    if (smsNumber.isBlank()) {
+                                        RunStatus.write(this@MainActivity, "Введи номер телефона для SMS")
+                                    } else {
+                                        activityScope.launch {
+                                            try {
+                                                val location = LocationSharing.currentLocation(this@MainActivity)
+                                                if (location == null) {
+                                                    RunStatus.write(this@MainActivity, "Не удалось определить геопозицию")
                                                 } else {
-                                                    startActivity(Intent.createChooser(sms, "Отправить координаты по SMS"))
+                                                    val message = "Мои координаты: https://maps.google.com/?q=${location.latitude},${location.longitude}"
+                                                    val sms = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(smsNumber)}"))
+                                                        .putExtra("sms_body", message)
+                                                    if (sms.resolveActivity(packageManager) == null) {
+                                                        RunStatus.write(this@MainActivity, "На устройстве нет приложения для SMS")
+                                                    } else {
+                                                        startActivity(Intent.createChooser(sms, "Отправить координаты по SMS"))
+                                                    }
                                                 }
+                                            } catch (error: Exception) {
+                                                RunStatus.write(this@MainActivity, "Не удалось получить координаты: ${error.message}")
                                             }
-                                        } catch (error: Exception) {
-                                            RunStatus.write(this@MainActivity, "Не удалось получить координаты: ${error.message}")
                                         }
                                     }
                                 }
-                            }
-                        ) { Text("Поделиться координатами по SMS") }
-                        Text(
-                            "Входящие SMS обрабатываются только пока запущен сервис и сценарий с on sms.received. " +
-                                "Запросите разрешение, если хотите передавать текст сообщения в условия сценария."
-                        )
-                        Button(
-                            onClick = {
-                                if (ContextCompat.checkSelfPermission(
-                                        this@MainActivity,
-                                        android.Manifest.permission.RECEIVE_SMS
-                                    ) == PackageManager.PERMISSION_GRANTED
-                                ) {
-                                    if (enabledScripts.isEmpty()) {
-                                        RunStatus.write(this@MainActivity, "Сначала включите сценарий с on sms.received")
+                            )
+                            MainTab.SETTINGS -> SettingsScreen(
+                                autoStartEnabled = autoStartEnabled,
+                                allowedSmsSender = allowedSmsSender,
+                                onAutoStartChange = {
+                                    autoStartEnabled = it
+                                    AutomationStore.setAutoStartEnabled(this@MainActivity, it)
+                                },
+                                onAllowedSenderChange = {
+                                    allowedSmsSender = it
+                                    AutomationStore.setSmsAllowedSender(this@MainActivity, it)
+                                },
+                                onRequestSmsPermission = {
+                                    if (ContextCompat.checkSelfPermission(this@MainActivity, android.Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED) {
+                                        if (enabledScripts.isEmpty()) {
+                                            RunStatus.write(this@MainActivity, "Сначала включи сценарий с on sms.received")
+                                        } else {
+                                            refreshAutomationService()
+                                            RunStatus.write(this@MainActivity, "Обработка входящих SMS включена")
+                                        }
                                     } else {
-                                        refreshAutomationService()
-                                        RunStatus.write(this@MainActivity, "Обработка входящих SMS включена")
+                                        permissionLauncher.launch(arrayOf(android.Manifest.permission.RECEIVE_SMS))
                                     }
-                                } else {
-                                    permissionLauncher.launch(arrayOf(android.Manifest.permission.RECEIVE_SMS))
-                                }
-                            }
-                        ) { Text("Разрешить чтение входящих SMS") }
-                        Text("Настройки фоновой работы", style = MaterialTheme.typography.titleMedium)
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text("Запускать сценарии после перезагрузки")
-                                Text(
-                                    "Запускаются только сценарии, отмеченные «Авто: вкл.»",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                            Switch(
-                                checked = autoStartEnabled,
-                                onCheckedChange = { enabled ->
-                                    autoStartEnabled = enabled
-                                    AutomationStore.setAutoStartEnabled(this@MainActivity, enabled)
+                                },
+                                onWriteSettings = {
+                                    startActivity(
+                                        Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
+                                            .setData(Uri.parse("package:$packageName"))
+                                    )
+                                },
+                                onAccessibility = { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+                                onBatterySettings = {
+                                    try {
+                                        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                                    } catch (error: Exception) {
+                                        RunStatus.write(this@MainActivity, "Не удалось открыть настройки батареи: ${error.message}")
+                                    }
                                 }
                             )
                         }
-                        OutlinedTextField(
-                            value = allowedSmsSender,
-                            onValueChange = {
-                                allowedSmsSender = it
-                                AutomationStore.setSmsAllowedSender(this@MainActivity, it)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            label = { Text("Разрешённый отправитель SMS (необязательно)") },
-                            supportingText = {
-                                Text("Пустое поле: принимать SMS от любых номеров. Заполнено: обрабатывать только этот номер.")
-                            },
-                            singleLine = true
-                        )
-                        Button(
-                            onClick = {
-                                try {
-                                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-                                } catch (error: Exception) {
-                                    RunStatus.write(
-                                        this@MainActivity,
-                                        "Не удалось открыть настройки оптимизации батареи: ${error.message}"
-                                    )
-                                }
-                            }
-                        ) { Text("Настройки оптимизации батареи") }
-                        Text(
-                            "Сервис остаётся активен при закрытии экрана приложения, пока есть включённые сценарии. " +
-                                "Для надёжной работы разрешите фоновую работу в настройках батареи устройства. " +
-                                "Принудительная остановка приложения остановит автоматизацию до следующего ручного запуска."
-                        )
-                        Text("Вывод: $runStatus", style = MaterialTheme.typography.bodyMedium)
                     }
                 }
             }
@@ -357,5 +337,336 @@ class MainActivity : ComponentActivity() {
         } catch (error: Exception) {
             RunStatus.write(this, "Ошибка запуска сервиса: ${error.message}")
         }
+    }
+
+    private fun toggleScript(name: String, enabledScripts: MutableList<String>, scripts: Map<String, String>) {
+        if (name in enabledScripts) enabledScripts.remove(name) else enabledScripts.add(name)
+        AutomationStore.setEnabledScripts(this, enabledScripts.toSet())
+        AutomationStore.saveScripts(this, scripts)
+        if (enabledScripts.isEmpty()) {
+            stopService(Intent(this, AutomationForegroundService::class.java))
+            RunStatus.write(this, "Все сценарии автоматизации остановлены")
+        } else {
+            refreshAutomationService()
+            RunStatus.write(this, "Активные сценарии обновлены")
+        }
+    }
+}
+
+private enum class MainTab(val label: String, val shortLabel: String) {
+    SCRIPTS("Сценарии", "●"),
+    EDITOR("Редактор", "✎"),
+    DEVICE("Устройство", "◉"),
+    SETTINGS("Настройки", "⚙")
+}
+
+private fun tabTitle(tab: MainTab): String = when (tab) {
+    MainTab.SCRIPTS -> "Мои сценарии"
+    MainTab.EDITOR -> "Редактор кода"
+    MainTab.DEVICE -> "Инструменты"
+    MainTab.SETTINGS -> "Настройки"
+}
+
+@Composable
+private fun NoxTheme(content: @Composable () -> Unit) {
+    val colors = darkColorScheme(
+        primary = Color(0xFF80CBC4),
+        onPrimary = Color(0xFF06201D),
+        secondary = Color(0xFF82B1FF),
+        background = Color(0xFF0B1015),
+        surface = Color(0xFF111820),
+        surfaceVariant = Color(0xFF1B2731),
+        onSurface = Color(0xFFE7EDF2),
+        onSurfaceVariant = Color(0xFFB5C2CC),
+        outline = Color(0xFF45545F)
+    )
+    MaterialTheme(colorScheme = colors, content = content)
+}
+
+@Composable
+private fun ColumnScope.ScriptsScreen(
+    scripts: Map<String, String>,
+    enabledScripts: List<String>,
+    selectedScript: String,
+    onSelect: (String) -> Unit,
+    onToggle: (String) -> Unit,
+    onAdd: () -> Unit,
+    onDelete: (String) -> Unit
+) {
+    Column(
+        Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            "${scripts.size} сценариев · ${enabledScripts.size} активно",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Button(onClick = onAdd, modifier = Modifier.fillMaxWidth()) { Text("＋  Новый сценарий") }
+        scripts.forEach { (name, source) ->
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = if (name == selectedScript) MaterialTheme.colorScheme.surfaceVariant
+                    else MaterialTheme.colorScheme.surface
+                ),
+                onClick = { onSelect(name) }
+            ) {
+                Column(
+                    Modifier.fillMaxWidth().padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(name, style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                if (name in enabledScripts) "Работает в фоне" else "Отключён",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(checked = name in enabledScripts, onCheckedChange = { onToggle(name) })
+                    }
+                    Text(
+                        source.lineSequence().firstOrNull()?.take(72)?.ifBlank { "Пустой сценарий" }
+                            ?: "Пустой сценарий",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilledTonalButton(onClick = { onSelect(name) }) { Text("Редактировать") }
+                        if (scripts.size > 1) {
+                            OutlinedButton(onClick = { onDelete(name) }) { Text("Удалить") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ColumnScope.EditorScreen(
+    scripts: Map<String, String>,
+    selectedScript: String,
+    onSelect: (String) -> Unit,
+    onScriptChange: (String) -> Unit,
+    onRun: () -> Unit,
+    onStop: () -> Unit,
+    onRunOnce: () -> Unit,
+    onDelete: () -> Unit
+) {
+    var menuExpanded by remember { mutableStateOf(false) }
+    Column(
+        Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        BoxDropdown(
+            selectedScript = selectedScript,
+            scriptNames = scripts.keys.toList(),
+            expanded = menuExpanded,
+            onExpandedChange = { menuExpanded = it },
+            onSelect = {
+                onSelect(it)
+                menuExpanded = false
+            }
+        )
+        OutlinedTextField(
+            value = scripts[selectedScript].orEmpty(),
+            onValueChange = onScriptChange,
+            modifier = Modifier.fillMaxWidth().height(360.dp),
+            label = { Text("Код сценария") },
+            textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace)
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button(onClick = onRun, modifier = Modifier.weight(1f)) { Text("Запустить") }
+            OutlinedButton(onClick = onStop, modifier = Modifier.weight(1f)) { Text("Остановить всё") }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            FilledTonalButton(onClick = onRunOnce, modifier = Modifier.weight(1f)) { Text("Один раз") }
+            if (scripts.size > 1) {
+                OutlinedButton(onClick = onDelete, modifier = Modifier.weight(1f)) { Text("Удалить") }
+            }
+        }
+        Text(
+            "«Запустить» сохраняет сценарий и включает его автоматическое выполнение. " +
+                "Для событийных сценариев оставь сервис работающим.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun BoxDropdown(
+    selectedScript: String,
+    scriptNames: List<String>,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onSelect: (String) -> Unit
+) {
+    Column {
+        OutlinedButton(onClick = { onExpandedChange(true) }, modifier = Modifier.fillMaxWidth()) {
+            Text("Сценарий: $selectedScript")
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { onExpandedChange(false) }) {
+            scriptNames.forEach { name ->
+                DropdownMenuItem(text = { Text(name) }, onClick = { onSelect(name) })
+            }
+        }
+    }
+}
+
+@Composable
+private fun ColumnScope.DeviceScreen(
+    smsNumber: String,
+    onSmsNumberChange: (String) -> Unit,
+    onFind: () -> Unit,
+    onStopFind: () -> Unit,
+    onShareLocation: () -> Unit
+) {
+    Column(
+        Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        FeatureCard(
+            title = "Найти телефон",
+            description = "Включает звуковой сигнал и мигает фонариком, пока не остановишь поиск."
+        ) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onFind, modifier = Modifier.weight(1f)) { Text("Начать поиск") }
+                OutlinedButton(onClick = onStopFind, modifier = Modifier.weight(1f)) { Text("Остановить") }
+            }
+        }
+        FeatureCard(
+            title = "Поделиться местоположением",
+            description = "Откроет SMS с координатами. Перед отправкой сообщение можно проверить."
+        ) {
+            OutlinedTextField(
+                value = smsNumber,
+                onValueChange = onSmsNumberChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Номер телефона") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                singleLine = true
+            )
+            Button(onClick = onShareLocation, modifier = Modifier.fillMaxWidth()) {
+                Text("Подготовить SMS с координатами")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ColumnScope.SettingsScreen(
+    autoStartEnabled: Boolean,
+    allowedSmsSender: String,
+    onAutoStartChange: (Boolean) -> Unit,
+    onAllowedSenderChange: (String) -> Unit,
+    onRequestSmsPermission: () -> Unit,
+    onWriteSettings: () -> Unit,
+    onAccessibility: () -> Unit,
+    onBatterySettings: () -> Unit
+) {
+    Column(
+        Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        FeatureCard(
+            title = "Фоновая работа",
+            description = "Foreground service показывает постоянное уведомление. Ограничения фоновой работы также зависят от прошивки."
+        ) {
+            SettingSwitch(
+                title = "Автозапуск после перезагрузки",
+                supporting = "Запускаются только сценарии, отмеченные «Авто».",
+                checked = autoStartEnabled,
+                onCheckedChange = onAutoStartChange
+            )
+            OutlinedButton(onClick = onBatterySettings, modifier = Modifier.fillMaxWidth()) {
+                Text("Параметры батареи")
+            }
+        }
+        FeatureCard(
+            title = "Входящие SMS",
+            description = "Событие sms.received передаёт отправителя и текст в переменные сценария."
+        ) {
+            OutlinedTextField(
+                value = allowedSmsSender,
+                onValueChange = onAllowedSenderChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Фильтр по номеру (необязательно)") },
+                supportingText = {
+                    Text("Пусто — сообщения от всех номеров; задан номер — только от него.")
+                },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                singleLine = true
+            )
+            Button(onClick = onRequestSmsPermission, modifier = Modifier.fillMaxWidth()) {
+                Text("Разрешить обработку SMS")
+            }
+        }
+        FeatureCard(
+            title = "Доступы Android",
+            description = "Некоторым действиям нужны специальные разрешения системы."
+        ) {
+            OutlinedButton(onClick = onWriteSettings, modifier = Modifier.fillMaxWidth()) {
+                Text("Доступ к системным настройкам")
+            }
+            OutlinedButton(onClick = onAccessibility, modifier = Modifier.fillMaxWidth()) {
+                Text("Специальные возможности")
+            }
+        }
+        Text(
+            "Свайп приложения из списка недавних обычно не останавливает сервис. " +
+                "Кнопка «Принудительно остановить» в системных настройках остановит его до следующего ручного запуска.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun FeatureCard(
+    title: String,
+    description: String,
+    content: @Composable () -> Unit
+) {
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+        Column(
+            Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(title, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            content()
+        }
+    }
+}
+
+@Composable
+private fun SettingSwitch(
+    title: String,
+    supporting: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(supporting, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
